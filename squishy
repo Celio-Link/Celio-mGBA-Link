@@ -1,0 +1,15 @@
+-- Define output file
+Output "dist/mGBACelioServer.lua"
+
+-- Add modules (will be available via require())
+Module "base64" "websocket/base64.lua"
+Module "frame" "websocket/frame.lua"
+Module "handshake" "websocket/handshake.lua"
+Module "server_client" "websocket/server_client.lua"
+Module "server" "websocket/server.lua"
+Module "sha1" "websocket/sha1.lua"
+Module "tools" "websocket/tools.lua"
+Module "websocket" "websocket.lua"
+
+-- Add main script (executed after modules are loaded)
+Main "mGBA-server.lua"
