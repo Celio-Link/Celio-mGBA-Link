@@ -2,11 +2,29 @@
 
 console:log("Starting websocket server")
 
-local Handshake = {
-  WAITING = "handshakeWaiting",
-  RECEIVED = "handshakeReceived",
-  START = "startHandshake",
-  CONNECT = "handshakeConnect"
+local LinkStatus = {
+
+  AwaitMode = 0xFF02,
+  HandshakeReceived = 0xFF03,
+  HandshakeFinished = 0xFF04,
+
+  LinkConnected = 0xFF05,
+  LinkReconnecting = 0xFF06,
+  LinkClosed = 0xFF07,
+
+  DeviceReady = 0xFF08,
+  EmuTradeSessionFinished = 0xFF09,
+
+  StatusDebug = 0xFFFF
+}
+
+local CommandType = {
+  SetMode = 0x00,
+  Cancel = 0x01,
+  SetModeMaster = 0x10,
+  SetModeSlave = 0x11,
+  StartHandshake= 0x12,
+  ConnectLink = 0x13
 }
 
 local Transive = {
@@ -17,8 +35,8 @@ local Transive = {
 
 local create_celio_client = function(ws)
   local celio_client = {
-    _server = Handshake.WAITING,
-    _client = Handshake.WAITING,
+    _server = LinkStatus.AwaitMode,
+    _client = LinkStatus.AwaitMode,
     _transive_state = Transive.HANDSHAKE,
     _received_queue = {},
     _transmit_queue = {},
@@ -55,36 +73,32 @@ local create_celio_client = function(ws)
     end
   end
 
+  function celio_client:checkSendStartHandshake()
+    if (celio_client._server == LinkStatus.HandshakeReceived and celio_client._server == LinkStatus.HandshakeReceived) then
+      celio_client._ws:send(CommandType.StartHandshake)
+    end
+  end
+
   function celio_client:transive_handshake(rx_value)
     console:log("Handshake")
     if (rx_value == 0xB9A0) then
-      if (celio_client._server == Handshake.WAITING) then
-        celio_client._server = Handshake.RECEIVED
-        celio_client._ws:send(Handshake.RECEIVED)
-      end
-
-      if (celio_client._client == Handshake.RECEIVED and
-          celio_client._server == Handshake.RECEIVED) then
-        celio_client._ws:send(Handshake.START)
-        celio_client._client = Handshake.START
-        celio_client._server = Handshake.START
+      if (celio_client._server == LinkStatus.AwaitMode) then
+        celio_client._server = LinkStatus.HandshakeReceived
+        celio_client:checkSendStartHandshake()
       end
     end
 
     if (rx_value == 0x8FFF) then
-      celio_client._ws:send(Handshake.CONNECT)
-      celio_client._client = Handshake.CONNECT
-      celio_client._server = Handshake.CONNECT
-
+      celio_client._ws:send(CommandType.ConnectLink)
       celio_client._transive_state = Transive.CRC
+      celio_client._server = LinkStatus.LinkConnected
     end
 
-    if (celio_client._server == Handshake.WAITING or celio_client._server == Handshake.RECEIVED) then
-      return 0xD15E
-    end
-    if (celio_client._server == Handshake.START or celio_client._server == Handshake.CONNECT) then
+    if (celio_client._server == LinkStatus.HandshakeReceived and celio_client._client == LinkStatus.HandshakeReceived) then
       return 0xB9A0
     end
+
+    return  0xD15E
   end
 
   function celio_client:transive_crc(rx_value)
@@ -150,14 +164,16 @@ local create_celio_client = function(ws)
   end
 
   function celio_client:receive_command(command)
-    if (command == Handshake.RECEIVED) then
-        celio_client._client = Handshake.RECEIVED
-        if (celio_client._server == Handshake.RECEIVED) then
-          celio_client._ws:send(Handshake.START)
-          celio_client._client = Handshake.START
-          celio_client._server = Handshake.START
-        end
-      end
+    if (command == LinkStatus.AwaitMode) then
+      celio_client._ws:send(CommandType.SetModeMaster)
+
+    elseif (command == LinkStatus.HandshakeReceived) then
+      celio_client._client = LinkStatus.HandshakeReceived
+      celio_client:checkSendStartHandshake()
+
+    elseif (command == LinkStatus.LinkConnected) then
+      celio_client._client = LinkStatus.LinkConnected
+    end
   end
 
   function celio_client:receive_data(data)
@@ -177,19 +193,17 @@ end
 
 local server = require'websocket'.server.listen
 {
-  port = 8080,
+  port = 51784,
   protocols = {
     celio = function(ws)
 
       local celio_client = create_celio_client(ws)
 
-      ws:send(Handshake.WAITING)
-
       ws:set_on_message(function(ws, message, opcode)
         if (opcode == require'websocket'.TEXT) then
           celio_client:receive_command(message)
         elseif (opcode == require'websocket'.BINARY) then
-          celio_client:receive_data(message)
+          celio_client:receive_data(tonumber(message))
         end
       end)
     end
