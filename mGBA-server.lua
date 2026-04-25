@@ -23,7 +23,7 @@ local CommandType = {
   Cancel = 0x01,
   SetModeMaster = 0x10,
   SetModeSlave = 0x11,
-  StartHandshake= 0x12,
+  StartHandshake = 0x12,
   ConnectLink = 0x13
 }
 
@@ -33,160 +33,270 @@ local Transive = {
   COMMAND = 2
 }
 
-local create_celio_client = function(ws)
-  local celio_client = {
-    _server = LinkStatus.AwaitMode,
-    _client = LinkStatus.AwaitMode,
-    _transive_state = Transive.HANDSHAKE,
-    _received_queue = {},
-    _transmit_queue = {},
-    _current_tx_command = {},
-    _current_rx_command = {},
+local create_celio_session = function (ws)
+
+  local create_state = function()
+    local state = {
+      _server = LinkStatus.AwaitMode,
+      _client = LinkStatus.AwaitMode,
+      _server_ready_reconnect = false,
+      _client_ready_reconnect = false,
+      _keep_alive = true,
+      _transive_state = Transive.HANDSHAKE,
+      _received_queue = {},
+      _transmit_queue = {},
+      _current_tx_command = {},
+      _current_rx_command = {}
+    }
+    return state
+  end
+
+  --////////////////////////////////////////////////////////////////////////////////////////////////////////--
+
+  local celio_session = {
+    state = create_state(),
     _ws = ws
   }
 
-  local rx_value_current = 0x00
-  local tx_value_current = 0x00
+  --////////////////////////////////////////////////////////////////////////////////////////////////////////--
 
-  emu:setWatchpoint(function ()
-      rx_value_current = emu:read16(0x400012A)
-      tx_value_current = celio_client:transive(rx_value_current)
-      emu:write16(0x4000120, rx_value_current)
-      emu:write16(0x4000122, rx_value_current)
-      console:log(string.format("0x%x", rx_value_current))
-      console:log(string.format("0x%x", tx_value_current))
-      console:log("\n")
-    end,
-    0x4000120,
-    C.WATCHPOINT_TYPE.READ
-  )
-
-  function celio_client:transive(rx_value)
-    if (celio_client._transive_state == Transive.HANDSHAKE) then
-      return celio_client:transive_handshake(rx_value)
+  function celio_session:transive(rx_value)
+    if (celio_session.state._transive_state == Transive.HANDSHAKE) then
+      return celio_session:transive_handshake(rx_value)
     end
-    if (celio_client._transive_state == Transive.CRC) then
-      return celio_client:transive_crc(rx_value)
+    if (celio_session.state._transive_state == Transive.CRC) then
+      return celio_session:transive_crc(rx_value)
     end
-    if (celio_client._transive_state == Transive.COMMAND) then
-      return celio_client:transive_command(rx_value)
+    if (celio_session.state._transive_state == Transive.COMMAND) then
+      return celio_session:transive_command(rx_value)
     end
   end
 
-  function celio_client:checkSendStartHandshake()
-    if (celio_client._server == LinkStatus.HandshakeReceived and celio_client._server == LinkStatus.HandshakeReceived) then
-      celio_client._ws:send(CommandType.StartHandshake)
+  --////////////////////////////////////////////////////////////////////////////////////////////////////////--
+
+  function celio_session:checkSendStartHandshake()
+    if (celio_session.state._server == LinkStatus.HandshakeReceived and celio_session.state._server == LinkStatus.HandshakeReceived) then
+      celio_session._ws:send(tostring(CommandType.StartHandshake))
     end
   end
 
-  function celio_client:transive_handshake(rx_value)
-    console:log("Handshake")
+  --////////////////////////////////////////////////////////////////////////////////////////////////////////--
+
+  function celio_session:transive_handshake(rx_value)
     if (rx_value == 0xB9A0) then
-      if (celio_client._server == LinkStatus.AwaitMode) then
-        celio_client._server = LinkStatus.HandshakeReceived
-        celio_client:checkSendStartHandshake()
+      if (celio_session.state._server == LinkStatus.AwaitMode) then
+        celio_session.state._server = LinkStatus.HandshakeReceived
+        celio_session:checkSendStartHandshake()
       end
     end
 
     if (rx_value == 0x8FFF) then
-      celio_client._ws:send(CommandType.ConnectLink)
-      celio_client._transive_state = Transive.CRC
-      celio_client._server = LinkStatus.LinkConnected
+      celio_session._ws:send(tostring(CommandType.ConnectLink))
+      celio_session.state._transive_state = Transive.CRC
+      celio_session.state._server = LinkStatus.LinkConnected
     end
 
-    if (celio_client._server == LinkStatus.HandshakeReceived and celio_client._client == LinkStatus.HandshakeReceived) then
+    if ((celio_session.state._server == LinkStatus.HandshakeReceived or celio_session.state._server == LinkStatus.LinkConnected)
+        and celio_session.state._client == LinkStatus.HandshakeReceived) then
       return 0xB9A0
     end
 
     return  0xD15E
   end
 
-  function celio_client:transive_crc(rx_value)
-    console:log("CRC")
-    celio_client._transive_state = Transive.COMMAND
+  --////////////////////////////////////////////////////////////////////////////////////////////////////////--
+
+  local flush_rx_queue = function ()
+    console:log("Flusing rx queue")
+    for i = #celio_session.state._transmit_queue, 32 do
+      table.insert(celio_session.state._transmit_queue, 0x00)
+    end
+    local fmt = ">" .. string.rep("I2", #celio_session.state._transmit_queue)
+    local data = string.pack(fmt, table.unpack(celio_session.state._transmit_queue))
+    celio_session.state._transmit_queue = {}
+    celio_session._ws:send(data, require'websocket'.BINARY)
+  end
+
+  --////////////////////////////////////////////////////////////////////////////////////////////////////////--
+
+  function celio_session:transive_crc(rx_value)
+
+    if (celio_session.state._client_ready_reconnect and celio_session.state._server_ready_reconnect) then
+      console:log("Reconnecting...")
+      flush_rx_queue()
+      celio_session.state = create_state()
+    else
+      celio_session.state._transive_state = Transive.COMMAND
+    end
     return rx_value
   end
 
+  --////////////////////////////////////////////////////////////////////////////////////////////////////////--
+
+  local print_command_db = function (prefix, command)
+    local print_command = false
+    for i = 1, #command do
+      if command[i] ~= 0x00 then
+        print_command = true
+        break
+      end
+    end
+
+    local command_string = ""
+    if (print_command) then
+      for i = 1, #command do
+        command_string = command_string .. string.format("0x%x", tonumber(command[i])) .. " "
+      end
+      console:log(prefix .. command_string)
+    end
+  end
+
+  --////////////////////////////////////////////////////////////////////////////////////////////////////////--
+
   local load_tx_command = function ()
-    if (#celio_client._received_queue == 0) then
-      celio_client._current_tx_command = {0,0,0,0,0,0,0,0}
+    if (#celio_session.state._received_queue == 0) then
+      celio_session.state._current_tx_command = {0,0,0,0,0,0,0,0}
     else
       for i = 1, 8 do
-        local dequeued_value = table.remove(celio_client._received_queue)
-        table.insert(celio_client._current_tx_command, dequeued_value)
+        local dequeued_value = table.remove(celio_session.state._received_queue, 1)
+        local swapped = ((dequeued_value >> 8) | (dequeued_value << 8)) & 0xFFFF
+        table.insert(celio_session.state._current_tx_command, swapped)
       end
     end
   end
 
+  --////////////////////////////////////////////////////////////////////////////////////////////////////////--
+
   local save_rx_command = function ()
+
+    -- queue_command if not all zero or if a command is already in queue to avoid stalling
     local queue_command = false
-    for i = 1, #celio_client._current_rx_command do
-      if celio_client._current_rx_command[i] ~= 0x00 then
+    for i = 1, #celio_session.state._current_rx_command do
+      if celio_session.state._current_rx_command[i] ~= 0x00 then
         queue_command = true
         break
       end
     end
 
+    if (#celio_session.state._transmit_queue > 0) then
+      queue_command = true
+    end
+
     if (queue_command) then
       for i = 1, 8 do
-        local dequeued_value = table.remove(celio_client._current_rx_command, 1)
-        table.insert(celio_client._transmit_queue, dequeued_value)
+        local dequeued_value = table.remove(celio_session.state._current_rx_command, 1)
+        table.insert(celio_session.state._transmit_queue, dequeued_value)
       end
     end
-    celio_client._current_rx_command = {}
+
+    celio_session.state._current_rx_command = {}
   end
 
-  local flush_rx_queue = function ()
-    local fmt = ">" .. string.rep("I2", #celio_client._transmit_queue)
-    local data = string.pack(fmt, table.unpack(celio_client._transmit_queue))
-    celio_client._transmit_queue = {}
-    celio_client._ws:send(data, require'websocket'.BINARY)
-  end
+  --////////////////////////////////////////////////////////////////////////////////////////////////////////--
 
-  function celio_client:transive_command(rx_value)
-    console:log("Command")
-    if (#celio_client._current_tx_command == 0) then
+  function celio_session:transive_command(rx_value)
+
+    table.insert(celio_session.state._current_rx_command, rx_value)
+
+    if (#celio_session.state._current_tx_command == 0) then
       load_tx_command()
+      if (celio_session.state._current_tx_command[1] == 0x5fff) then
+        console:log("Client ready for reconnect")
+        celio_session.state._client_ready_reconnect = true
+      end
+      print_command_db("tx command ", celio_session.state._current_tx_command)
     end
 
-    table.insert(celio_client._current_rx_command, rx_value)
+    if (#celio_session.state._current_rx_command == 8) then
+      print_command_db("rx command ", celio_session.state._current_rx_command)
 
-    if (#celio_client._current_rx_command == 8) then
+      if (celio_session.state._current_rx_command[1] == 0x5fff) then
+        console:log("Server ready for reconnect")
+        celio_session.state._server_ready_reconnect = true
+      end
       save_rx_command()
-      celio_client._transive_state = Transive.CRC
+
+      celio_session.state._transive_state = Transive.CRC
     end
 
-    if (#celio_client._transmit_queue >= 32) then
+    if (#celio_session.state._transmit_queue >= 32) then
       flush_rx_queue()
     end
 
-    return table.remove(celio_client._current_tx_command)
+    return table.remove(celio_session.state._current_tx_command, 1)
   end
 
-  function celio_client:receive_command(command)
-    if (command == LinkStatus.AwaitMode) then
-      celio_client._ws:send(CommandType.SetModeMaster)
+  --////////////////////////////////////////////////////////////////////////////////////////////////////////--
 
-    elseif (command == LinkStatus.HandshakeReceived) then
-      celio_client._client = LinkStatus.HandshakeReceived
-      celio_client:checkSendStartHandshake()
+  function celio_session:receive_status(status)
+    if (status == LinkStatus.AwaitMode) then
+      console:log("Received status: AwaitMode")
+      celio_session._ws:send(tostring(CommandType.SetModeMaster))
 
-    elseif (command == LinkStatus.LinkConnected) then
-      celio_client._client = LinkStatus.LinkConnected
+    elseif (status == LinkStatus.HandshakeReceived) then
+      console:log("Received status: HandshakeReceived")
+      celio_session.state._client = LinkStatus.HandshakeReceived
+      celio_session:checkSendStartHandshake()
+
+    elseif (status == LinkStatus.LinkConnected) then
+      console:log("Received status: LinkConnected")
+      celio_session.state._client = LinkStatus.LinkConnected
+
+    elseif (status == LinkStatus.LinkClosed) then
+      console:log("Received status: LinkClosed")
+      celio_session.state._client = LinkStatus.LinkConnected
     end
   end
+
+  --////////////////////////////////////////////////////////////////////////////////////////////////////////--
+
+  function celio_session:receive_data(data)
+    for i = 1, #data, 2 do
+      local value = string.unpack(">I2", data, i)
+      table.insert(celio_session.state._received_queue, value)
+      end
+  end
+
+  --////////////////////////////////////////////////////////////////////////////////////////////////////////--
+
+  return celio_session
+end
+
+local create_celio_client = function(ws)
+  local celio_client = {
+    _ws = ws,
+    _session = create_celio_session(ws)
+  }
+
+  --////////////////////////////////////////////////////////////////////////////////////////////////////////--
+
+  emu:setWatchpoint(function ()
+      local rx_value_current = emu:read16(0x400012A)
+      local tx_value_current = celio_client._session:transive(rx_value_current)
+      emu:write16(0x4000120, rx_value_current)
+      emu:write16(0x4000122, tx_value_current)
+    end,
+    0x4000120,
+    C.WATCHPOINT_TYPE.READ
+  )
+
+  --////////////////////////////////////////////////////////////////////////////////////////////////////////--
+
+  function celio_client:receive_status(status)
+    celio_client._session:receive_status(status)
+  end
+
+  --////////////////////////////////////////////////////////////////////////////////////////////////////////--
 
   function celio_client:receive_data(data)
     if #data % 16 ~= 0 then
       console:error("Data is not a multiply of 16, data size: " .. #data)
       return
     end
-
-    for i = 1, #data, 2 do
-      local value = string.unpack(">I2", data, i)
-      table.insert(celio_client._received_queue, value)
-      end
+    celio_client._session:receive_data(data)
   end
+
+  --////////////////////////////////////////////////////////////////////////////////////////////////////////--
 
   return celio_client
 end
@@ -201,9 +311,10 @@ local server = require'websocket'.server.listen
 
       ws:set_on_message(function(ws, message, opcode)
         if (opcode == require'websocket'.TEXT) then
-          celio_client:receive_command(message)
+          console:log("Received raw status: " .. string.format("0x%x", tonumber(message)))
+          celio_client:receive_status(tonumber(message))
         elseif (opcode == require'websocket'.BINARY) then
-          celio_client:receive_data(tonumber(message))
+          celio_client:receive_data(message)
         end
       end)
     end
