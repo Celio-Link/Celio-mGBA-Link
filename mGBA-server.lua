@@ -231,6 +231,7 @@ local create_celio_session = function (ws)
   function celio_session:receive_status(status)
     if (status == LinkStatus.AwaitMode) then
       console:log("Received status: AwaitMode")
+      console:log(tostring(celio_session._ws))
       celio_session._ws:send(tostring(CommandType.SetModeMaster))
 
     elseif (status == LinkStatus.HandshakeReceived) then
@@ -263,22 +264,12 @@ local create_celio_session = function (ws)
 end
 
 local create_celio_client = function(ws)
+
+  console:log("Instanciating new client")
   local celio_client = {
     _ws = ws,
     _session = create_celio_session(ws)
   }
-
-  --////////////////////////////////////////////////////////////////////////////////////////////////////////--
-
-  emu:setWatchpoint(function ()
-      local rx_value_current = emu:read16(0x400012A)
-      local tx_value_current = celio_client._session:transive(rx_value_current)
-      emu:write16(0x4000120, rx_value_current)
-      emu:write16(0x4000122, tx_value_current)
-    end,
-    0x4000120,
-    C.WATCHPOINT_TYPE.READ
-  )
 
   --////////////////////////////////////////////////////////////////////////////////////////////////////////--
 
@@ -301,13 +292,28 @@ local create_celio_client = function(ws)
   return celio_client
 end
 
+local celio_client = nil
+
+local watchpointId = emu:setWatchpoint(function ()
+    local rx_value_current = emu:read16(0x400012A)
+    if (celio_client == nil) then return end
+    local tx_value_current = celio_client._session:transive(rx_value_current)
+    emu:write16(0x4000120, rx_value_current)
+    emu:write16(0x4000122, tx_value_current)
+    emu:write16(0x4000124, 0xFFFF)
+    emu:write16(0x4000126, 0xFFFF)
+  end,
+  0x4000120,
+  C.WATCHPOINT_TYPE.READ
+)
+
 local server = require'websocket'.server.listen
 {
   port = 51784,
   protocols = {
     celio = function(ws)
 
-      local celio_client = create_celio_client(ws)
+      celio_client = create_celio_client(ws)
 
       ws:set_on_message(function(ws, message, opcode)
         if (opcode == require'websocket'.TEXT) then
