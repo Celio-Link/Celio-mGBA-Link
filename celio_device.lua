@@ -50,11 +50,12 @@ local create_celio_device = function(emit_status_callback, emit_data_callback)
       _gba_reconnect = false,
       _keep_alive = true,
       _start_response = false,
-   
+
       _received_queue = {},
       _transmit_queue = {},
       _current_tx_command = {},
-      _current_rx_command = {}
+      _current_rx_command = {},
+      _empty_direction_streak = 0
     }
     if (not init) then state._handshakeState = HandshakeState.LISTENING end
     return state
@@ -126,9 +127,9 @@ local create_celio_device = function(emit_status_callback, emit_data_callback)
   function celio_device:transive_crc(rx_value)
 
     if (celio_device.state._emu_reconnect and celio_device.state._gba_reconnect) then
+      flush_rx_queue()
       if (celio_device.state._keep_alive) then
         console:log("Emulated Device: Reconnecting...")
-        flush_rx_queue()
         celio_device.emit_status(LinkStatus.LinkReconnecting)
         celio_device.state = create_state(false)
       else
@@ -179,6 +180,17 @@ local create_celio_device = function(emit_status_callback, emit_data_callback)
 
   local save_rx_command = function ()
 
+    -- "Packet inspect" and filter unneeded "direction none" commands so only one is transmitted per streak
+    if (celio_device.state._current_rx_command[1] == 0xcafe and celio_device.state._current_rx_command[2] == 0x0011) then
+      celio_device.state._empty_direction_streak = celio_device.state._empty_direction_streak + 1
+      if (celio_device.state._empty_direction_streak > 1) then
+        celio_device.state._current_rx_command[1] = 0x00
+        celio_device.state._current_rx_command[2] = 0x00
+      end
+    else
+      celio_device.state._empty_direction_streak = 0
+    end
+
     -- queue_command if not all zero or if a command is already in queue to avoid stalling
     local queue_command = false
     for i = 1, #celio_device.state._current_rx_command do
@@ -193,6 +205,7 @@ local create_celio_device = function(emit_status_callback, emit_data_callback)
     end
 
     if (queue_command) then
+      print_command_db("rx command ", celio_device.state._current_rx_command)
       for i = 1, 8 do
         local dequeued_value = table.remove(celio_device.state._current_rx_command, 1)
         table.insert(celio_device.state._transmit_queue, dequeued_value)
@@ -221,8 +234,6 @@ local create_celio_device = function(emit_status_callback, emit_data_callback)
     end
 
     if (#celio_device.state._current_rx_command == 8) then
-      print_command_db("rx command ", celio_device.state._current_rx_command)
-
       if (celio_device.state._current_rx_command[1] == 0x5fff) then
         console:log("Emulated Device: Ready for reconnect")
         celio_device.state._gba_reconnect = true
