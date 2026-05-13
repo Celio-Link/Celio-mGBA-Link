@@ -2,63 +2,28 @@
 
 console:log("Starting websocket server")
 
-local LinkStatus = {
-
-  AwaitMode = 0xFF02,
-  HandshakeReceived = 0xFF03,
-  HandshakeFinished = 0xFF04,
-
-  LinkConnected = 0xFF05,
-  LinkReconnecting = 0xFF06,
-  LinkClosed = 0xFF07,
-
-  DeviceReady = 0xFF08,
-  EmuTradeSessionFinished = 0xFF09,
-
-  StatusDebug = 0xFFFF
+local Direction = {
+  SERVER = "Server",
+  CLIENT = "Client"
 }
 
-local CommandType = {
-  SetMode = 0x00,
-  Cancel = 0x01,
-  SetModeMaster = 0x10,
-  SetModeSlave = 0x11,
-  StartHandshake = 0x12,
-  ConnectLink = 0x13,
+LinkStatus = require('celio_device').LinkStatus
+CommandType = require('celio_device').CommandType
 
-  EmuSessionStart = 0xFF0A
-}
-
-local Transive = {
-  HANDSHAKE = 0,
-  CRC = 1,
-  COMMAND = 2
-}
-
-local Source = {
-  SERVER = 0,
-  CLIENT = 1
-}
-
-local create_celio_server = function (ws)
+local create_celio_server = function (send)
 
   local celio_server = {
-    _ws = ws,
-    _celio_device = nil,
+    _send = send,
     _server = LinkStatus.AwaitMode,
     _client = LinkStatus.AwaitMode,
   }
 
-  function celio_server:set_celio_device(device)
-    celio_server._celio_device = device
-  end
-
   --////////////////////////////////////////////////////////////////////////////////////////////////////////--
 
   function celio_server:checkSendStartHandshake()
-    if (celio_server._server == LinkStatus.HandshakeReceived and celio_server._server == LinkStatus.HandshakeReceived) then
-      celio_server._ws:send(tostring(CommandType.StartHandshake))
-      celio_server._celio_device:receive_command(CommandType.StartHandshake)
+    if (celio_server._server == LinkStatus.HandshakeReceived and celio_server._client == LinkStatus.HandshakeReceived) then
+      celio_server._send(Direction.CLIENT, tostring(CommandType.StartHandshake), require'websocket'.TEXT)
+      celio_server._send(Direction.SERVER, tostring(CommandType.StartHandshake), require'websocket'.TEXT)
     end
   end
 
@@ -67,56 +32,74 @@ local create_celio_server = function (ws)
   function celio_server:receive_status(source, status)
     if (status == LinkStatus.AwaitMode) then
       console:log("Received status: AwaitMode")
-      if (source == Source.CLIENT) then
-        celio_server._ws:send(tostring(CommandType.SetModeMaster))
-      elseif (source == Source.SERVER)  then
-         celio_server._celio_device:receive_command(CommandType.SetModeSlave)
+      if (source == Direction.CLIENT) then
+        celio_server._send(Direction.CLIENT, tostring(CommandType.SetModeMaster), require'websocket'.TEXT)
+      elseif (source == Direction.SERVER)  then
+        celio_server._send(Direction.SERVER, tostring(CommandType.SetModeSlave), require'websocket'.TEXT)
       end
 
     elseif (status == LinkStatus.HandshakeReceived) then
       console:log("Received status: HandshakeReceived")
-      if (source == Source.CLIENT) then
+      if (source == Direction.CLIENT) then
         celio_server._client = LinkStatus.HandshakeReceived
-      elseif (source == Source.SERVER)  then
+      elseif (source == Direction.SERVER)  then
         celio_server._server = LinkStatus.HandshakeReceived
       end
       celio_server:checkSendStartHandshake()
 
     elseif (status == LinkStatus.LinkConnected) then
       console:log("Received status: LinkConnected")
-      if (source == Source.CLIENT) then
+      if (source == Direction.CLIENT) then
         celio_server._client = LinkStatus.LinkConnected
-        celio_server._celio_device:receive_command(CommandType.ConnectLink)
-      elseif (source == Source.SERVER)  then
+        celio_server._send(Direction.SERVER, tostring(CommandType.ConnectLink), require'websocket'.TEXT)
+      elseif (source == Direction.SERVER)  then
         celio_server._server = LinkStatus.LinkConnected
-        celio_server._ws:send(tostring(CommandType.ConnectLink))
+        celio_server._send(Direction.CLIENT, tostring(CommandType.ConnectLink), require'websocket'.TEXT)
       end
-      
-      elseif (status == LinkStatus.LinkReconnecting) then
-        console:log("Received status: LinkReconnecting")
-        if (source == Source.CLIENT) then
-          celio_server._client = LinkStatus.LinkReconnecting
-        elseif (source == Source.SERVER)  then
-          celio_server._server = LinkStatus.LinkReconnecting
-        end
+
+    elseif (status == LinkStatus.LinkReconnecting) then
+      console:log("Received status: LinkReconnecting")
+      if (source == Direction.CLIENT) then
+        celio_server._client = LinkStatus.LinkReconnecting
+      elseif (source == Direction.SERVER)  then
+        celio_server._server = LinkStatus.LinkReconnecting
+      end
 
     elseif (status == LinkStatus.LinkClosed) then
       console:log("Received status: LinkClosed")
-      celio_server.state._client = LinkStatus.LinkClosed
+      if (source == Direction.CLIENT) then
+        celio_server._client = LinkStatus.LinkClosed
+      elseif (source == Direction.SERVER)  then
+        celio_server._server = LinkStatus.LinkClosed
+      end
     end
   end
 
   --////////////////////////////////////////////////////////////////////////////////////////////////////////--
 
   function celio_server:receive_data(source, data)
-    if (source == Source.SERVER) then
-      celio_server._ws:send(data, require'websocket'.BINARY)
-    elseif (source == Source.CLIENT) then
-      celio_server._celio_device:receive_data(data)
+    if (source == Direction.SERVER) then
+      celio_server._send(Direction.CLIENT, data, require'websocket'.BINARY)
+    elseif (source == Direction.CLIENT) then
+      celio_server._send(Direction.SERVER, data, require'websocket'.BINARY)
     end
   end
 
   --////////////////////////////////////////////////////////////////////////////////////////////////////////--
+
+  function celio_server:receive(source, message, opcode)
+    if (opcode == require'websocket'.TEXT) then
+      if (source == Direction.SERVER) then
+        console:log("Received raw status from emulated device: " .. string.format("0x%x", tonumber(message)))
+      end
+      if (source == Direction.CLIENT) then 
+        console:log("Received raw status from connected device: " .. string.format("0x%x", tonumber(message)))
+      end
+      celio_server:receive_status(source, tonumber(message))
+    elseif (opcode == require'websocket'.BINARY) then
+      celio_server:receive_data(source, message)
+    end
+  end
 
   return celio_server
 end
@@ -143,44 +126,36 @@ local server = require'websocket'.server.listen
   protocols = {
     celio_local = function(ws)
 
-      local celio_server = create_celio_server(ws)
-
-      celio_device = celio_device_factory.create_celio_device(function(message, opcode)
-        if (opcode == require'websocket'.TEXT) then
-          console:log("Received raw status from emulated device: " .. string.format("0x%x", tonumber(message)))
-          celio_server:receive_status(Source.SERVER, tonumber(message))
-        elseif (opcode == require'websocket'.BINARY) then
-          celio_server:receive_data(Source.SERVER, message)
+      local celio_server = create_celio_server(function(dest, message, opcode)
+        if (dest == Direction.SERVER and celio_device ~= nil) then
+          celio_device:receive(message, opcode)
+        elseif (dest == Direction.CLIENT) then
+          ws:send(message, opcode)
         end
       end)
 
-      celio_server:set_celio_device(celio_device)
+      celio_device = celio_device_factory.create_celio_device(
+        function(message) celio_server:receive(Direction.SERVER, tostring(message), require'websocket'.TEXT) end,
+        function(message) celio_server:receive(Direction.SERVER, message, require'websocket'.BINARY) end
+      )
+
       celio_device:receive_command(CommandType.EmuSessionStart)
 
       ws:set_on_message(function(ws, message, opcode)
-        if (opcode == require'websocket'.TEXT) then
-          console:log("Received raw status from socket: " .. string.format("0x%x", tonumber(message)))
-          celio_server:receive_status(Source.CLIENT, tonumber(message))
-        elseif (opcode == require'websocket'.BINARY) then
-          celio_server:receive_data(Source.CLIENT, message)
-        end
+        celio_server:receive(Direction.CLIENT, message, opcode)
       end)
 
     end,
 
     celio_online = function(ws)
 
-      celio_device = require'celio_device'.create_celio_device(function(message, opcode)
-        ws:send(message, opcode)
-      end)
+      celio_device = require'celio_device'.create_celio_device(
+        function(message) ws:send(tostring(message), require'websocket'.TEXT) end,
+        function(message) ws:send(message, require'websocket'.BINARY) end
+      )
 
       ws:set_on_message(function(ws, message, opcode)
-        if (opcode == require'websocket'.TEXT) then
-          console:log("Received raw status: " .. string.format("0x%x", tonumber(message)))
-          celio_device:receive_command(tonumber(message))
-        elseif (opcode == require'websocket'.BINARY) then
-          celio_device:receive_data(message)
-        end
+        celio_device:receive(message, opcode)
       end)
     end,
   }
