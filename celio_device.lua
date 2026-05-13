@@ -72,10 +72,10 @@ local create_celio_device = function(emit_status_callback, emit_data_callback)
 
   function celio_device:transive(rx_value)
     if (celio_device.state._transive_state == Transive.HANDSHAKE) then
-      local tx_value = celio_device:transive_handshake(rx_value)
-      console:log("Handshake - RX: " .. string.format("0x%x", rx_value) .. " TX: " .. string.format("0x%x", tx_value))
-      console:log("HandshakeState " .. tonumber(celio_device.state._handshakeState))
-      return tx_value
+      -- local tx_value = celio_device:transive_handshake(rx_value)
+      -- console:log("Handshake - RX: " .. string.format("0x%x", rx_value) .. " TX: " .. string.format("0x%x", tx_value))
+      -- console:log("HandshakeState " .. tonumber(celio_device.state._handshakeState))
+      return celio_device:transive_handshake(rx_value)
     end
     if (celio_device.state._transive_state == Transive.CRC) then
       return celio_device:transive_crc(rx_value)
