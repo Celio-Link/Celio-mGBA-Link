@@ -7,7 +7,7 @@ local server = nil
 local watchpointId = nil
 
 console:log("Celio-mGBA-Link Version 0.1")
-console:log("Wating for emulation to start")
+console:log("Waiting for emulation to start")
 
 local function start()
 
@@ -21,7 +21,6 @@ local function start()
       emu.memory.io:write16(0x122, tx_value_current)
       emu.memory.io:write16(0x124, 0xFFFF)
       emu.memory.io:write16(0x126, 0xFFFF)
-      console:log("" .. rx_value_current)
     end,
     0x4000120,
     C.WATCHPOINT_TYPE.READ
