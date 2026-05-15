@@ -1,14 +1,10 @@
-
-
-console:log("Starting websocket server")
+LinkStatus = require('celio_device').LinkStatus
+CommandType = require('celio_device').CommandType
 
 local Direction = {
   SERVER = "Server",
   CLIENT = "Client"
 }
-
-LinkStatus = require('celio_device').LinkStatus
-CommandType = require('celio_device').CommandType
 
 local create_celio_server = function (send)
 
@@ -104,59 +100,7 @@ local create_celio_server = function (send)
   return celio_server
 end
 
-local celio_device = nil
-local celio_device_factory = require'celio_device'
-
-local watchpointId = emu:setWatchpoint(function ()
-    local rx_value_current = emu:read16(0x400012A)
-    if (celio_device == nil) then return end
-    local tx_value_current = celio_device:transive(rx_value_current)
-    emu:write16(0x4000120, rx_value_current)
-    emu:write16(0x4000122, tx_value_current)
-    emu:write16(0x4000124, 0xFFFF)
-    emu:write16(0x4000126, 0xFFFF)
-  end,
-  0x4000120,
-  C.WATCHPOINT_TYPE.READ
-)
-
-local server = require'websocket'.server.listen
-{
-  port = 51784,
-  protocols = {
-    celio_local = function(ws)
-
-      local celio_server = create_celio_server(function(dest, message, opcode)
-        if (dest == Direction.SERVER and celio_device ~= nil) then
-          celio_device:receive(message, opcode)
-        elseif (dest == Direction.CLIENT) then
-          ws:send(message, opcode)
-        end
-      end)
-
-      celio_device = celio_device_factory.create_celio_device(
-        function(message) celio_server:receive(Direction.SERVER, tostring(message), require'websocket'.TEXT) end,
-        function(message) celio_server:receive(Direction.SERVER, message, require'websocket'.BINARY) end
-      )
-
-      celio_device:receive_command(CommandType.EmuSessionStart)
-
-      ws:set_on_message(function(ws, message, opcode)
-        celio_server:receive(Direction.CLIENT, message, opcode)
-      end)
-
-    end,
-
-    celio_online = function(ws)
-
-      celio_device = require'celio_device'.create_celio_device(
-        function(message) ws:send(tostring(message), require'websocket'.TEXT) end,
-        function(message) ws:send(message, require'websocket'.BINARY) end
-      )
-
-      ws:set_on_message(function(ws, message, opcode)
-        celio_device:receive(message, opcode)
-      end)
-    end,
-  }
+return {
+  create_celio_server = create_celio_server,
+  Direction = Direction
 }

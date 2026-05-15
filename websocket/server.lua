@@ -17,7 +17,7 @@ local listen = function(opts)
   listener = socket.bind(nil , opts.port)
 
   if not listener then
-    console:error("WS: Listening filed with error. Port already in use?")
+    console:error("WS: Listening failed with error. Port already in use?")
     return
   else
     console:log("WS: Listening...")
@@ -46,7 +46,7 @@ local listen = function(opts)
     local client_sock = listener:accept()
 
     if not client_sock then
-      console:error("WS: Error when accepting connection")
+      console:error("WS: Error during accept of connection")
       return
     end
 
