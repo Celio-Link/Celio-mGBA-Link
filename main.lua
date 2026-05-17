@@ -11,6 +11,11 @@ console:log("Waiting for emulation to start")
 
 local function start()
 
+  if (system.commit ~= "7c1fde50ad1c66d3c41cd25cb2ca5bdb6dbc5332") then
+    console:error("This script is not comatible with the version of mGBA that it was loaded with.")
+    console:log("Please visit https://github.com/Exormeter/mgba/releases to obtain a compatible release and script")
+    return
+  end
   console:log("Registering SIO watchpoint")
 
   watchpointId = emu:setWatchpoint(function ()

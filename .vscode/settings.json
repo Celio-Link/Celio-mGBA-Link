@@ -4,6 +4,7 @@
         "callbacks",
         "emu",
         "socket",
-        "C"
+        "C",
+        "system"
     ]
 }
