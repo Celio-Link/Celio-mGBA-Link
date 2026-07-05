@@ -39,6 +39,20 @@ local HandshakeState = {
   RESPONDING = 3
 }
 
+local Mode = {
+  MASTER = 0,
+  SLAVE = 1
+}
+
+local IE_REG = 0x200
+local IF_REG = 0x202
+
+local TM3CNT_L = 0x10C
+local TM3CNT_H = 0x10E
+
+local SIO_IRQ_IE_MASK = 0x80
+local SIO_IRQ_IF_MASK = 0x80
+
 local create_celio_device = function(emit_status_callback, emit_data_callback)
 
   local create_state = function(init)
@@ -50,6 +64,7 @@ local create_celio_device = function(emit_status_callback, emit_data_callback)
       _gba_reconnect = false,
       _keep_alive = true,
       _start_response = false,
+      _start_connect = false, --this field is only relevent in master mode
 
       _received_queue = {},
       _transmit_queue = {},
@@ -66,7 +81,8 @@ local create_celio_device = function(emit_status_callback, emit_data_callback)
   local celio_device = {
     state = create_state(true),
     emit_status = emit_status_callback,
-    emit_data = emit_data_callback
+    emit_data = emit_data_callback,
+    mode = Mode.SLAVE
   }
 
   --////////////////////////////////////////////////////////////////////////////////////////////////////////--
@@ -88,10 +104,56 @@ local create_celio_device = function(emit_status_callback, emit_data_callback)
 
   --////////////////////////////////////////////////////////////////////////////////////////////////////////--
 
+  function celio_device:enable_timer3()
+    emu.memory.io:write16(TM3CNT_L, 0xFF3B); -- Tim3 Reload Counter | OV at 197 ticks
+    emu.memory.io:write16(TM3CNT_H, 0x00C1); -- Tim3 Enable | Request IRQ | 64 Prescaler
+  end
+
+    --////////////////////////////////////////////////////////////////////////////////////////////////////////--
+
+  function celio_device:disable_timer3()
+    emu.memory.io:write16(TM3CNT_L, 0x0000);
+    emu.memory.io:write16(TM3CNT_H, 0x0000);
+  end
+
+  --////////////////////////////////////////////////////////////////////////////////////////////////////////--
+
+  function celio_device:sync_timer()
+    local ie_reg_value = emu.memory.io:read16(IE_REG)
+    if (celio_device.mode == Mode.SLAVE or (ie_reg_value & SIO_IRQ_IE_MASK) == 0) then return end
+    local if_reg_value = emu.memory.io:read16(IF_REG)
+    if_reg_value = if_reg_value | SIO_IRQ_IF_MASK
+    emu.memory.io:write16(0x202, if_reg_value)
+    if (celio_device.state._transive_state == Transive.CRC) then
+      celio_device:enable_timer3()
+    end
+    return true
+  end
+
+  --////////////////////////////////////////////////////////////////////////////////////////////////////////--
+
+  function celio_device:transmission_timer()
+    local if_reg_value = emu.memory.io:read16(IF_REG)
+    if_reg_value = if_reg_value & 0xFFBF --Reset Tim3 irq IF
+    if_reg_value = if_reg_value | SIO_IRQ_IF_MASK
+    emu.memory.io:write16(0x202, if_reg_value)
+    if (celio_device.state._transive_state == Transive.CRC) then
+      celio_device:disable_timer3()
+    end
+  end
+
+  --////////////////////////////////////////////////////////////////////////////////////////////////////////--
+
   function celio_device:transive_handshake(rx_value)
     if (rx_value == 0xB9A0 and celio_device.state._handshakeState == HandshakeState.LISTENING) then
       celio_device.emit_status(LinkStatus.HandshakeReceived)
       celio_device.state._handshakeState = HandshakeState.WAITING_TO_RESPOND
+    end
+
+    if (celio_device.state._start_connect) then
+      celio_device.emit_status(LinkStatus.LinkConnected)
+      celio_device.state._transive_state = Transive.CRC
+      return 0x8FFF
     end
 
     if (rx_value == 0x8FFF) then
@@ -265,14 +327,25 @@ local create_celio_device = function(emit_status_callback, emit_data_callback)
     elseif (command == CommandType.SetModeSlave) then
       console:log("Emulated Device - Received Command: SetModeSlave")
       celio_device.state._handshakeState = HandshakeState.LISTENING
+      celio_device.mode = Mode.SLAVE
+      -- FIXME put mGBA to master mode
 
     elseif (command == CommandType.SetModeMaster) then
-      console:error("master mode is currently not supported")
+      console:log("Emulated Device - Received Command: SetModeMaster")
+      celio_device.state._handshakeState = HandshakeState.LISTENING
+      celio_device.mode = Mode.MASTER
+      -- FIXME put mGBA to slave mode
 
     elseif (command == CommandType.StartHandshake) then
       console:log("Emulated Device - Received Command: StartHandshake")
       -- celio_device.state._handshakeState = HandshakeState.RESPONDING
       celio_device.state._start_response = true
+
+    elseif (command == CommandType.ConnectLink) then
+      celio_device.state._start_connect = true
+      console:log("Emulated Device - Received Command: ConnectLink")
+      
+
     else
       console:warn("Received unknown command " .. tostring(command))
     end

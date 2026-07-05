@@ -18,7 +18,8 @@ local function start()
   end
   console:log("Registering SIO watchpoint")
 
-  watchpointId = emu:setWatchpoint(function ()
+  watchpointId = emu:setWatchpoint(
+    function ()
       local rx_value_current = emu.memory.io:read16(0x12A)
       if (celio_device == nil) then return end
       local tx_value_current = celio_device:transive(rx_value_current)
@@ -29,6 +30,24 @@ local function start()
     end,
     0x4000120,
     C.WATCHPOINT_TYPE.READ
+  )
+
+  console:log("Registering vblanck IRQ callback")
+
+  callbacks:add("vblankIRQ",
+    function ()
+      if (celio_device == nil) then return end
+      celio_device:sync_timer()
+    end
+  )
+
+  console:log("Registering timer3 IRQ callback")
+
+  callbacks:add("timer3IRQ",
+    function ()
+      if (celio_device == nil) then return end
+      celio_device:transmission_timer()
+    end
   )
 
   console:log("Starting websocket server \n")
