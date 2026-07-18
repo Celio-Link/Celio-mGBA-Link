@@ -119,7 +119,6 @@ local create_celio_device = function(emit_status_callback, emit_data_callback)
     if (celio_device.state._masterState.timer_enabled) then
       return
     end
-    console:log("Enable Timer3")
     celio_device.state._masterState.timer_enabled = true
     emu.memory.io:write16(0x10C, 0xFED0); -- Tim3 Reload Counter | OV at 197 ticks
     emu.memory.io:write16(TM3CNT_H, 0x00C1); -- Tim3 Enable | Request IRQ | 64 Prescaler
@@ -128,7 +127,6 @@ local create_celio_device = function(emit_status_callback, emit_data_callback)
     --////////////////////////////////////////////////////////////////////////////////////////////////////////--
 
   function celio_device:disable_timer3()
-    console:log("Disable Timer3")
     celio_device.state._masterState.timer_enabled = false
     celio_device.state._masterState.timer_count = 0
     emu.memory.io:write16(TM3CNT_H, 0x0000);
@@ -162,7 +160,7 @@ local create_celio_device = function(emit_status_callback, emit_data_callback)
     if (celio_device.mode == Mode.SLAVE or (ie_reg_value & SIO_IRQ_IE_MASK) == 0) then
       return
     end
-    console:log(tostring(celio_device.state._masterState.timer_count))
+
     local if_reg_value = emu.memory.io:read16(IF_REG)
     if_reg_value = if_reg_value & 0xFFBF --Reset Tim3 irq IF
     if_reg_value = if_reg_value | SIO_IRQ_IF_MASK
