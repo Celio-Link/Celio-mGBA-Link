@@ -14,7 +14,7 @@ local function start()
 
   if (system.commit ~= "3da13060a586f2da8eb4ecbb167f642e2e4889c2") then
     console:error("This script is not comatible with the version of mGBA that it was loaded with.")
-    console:log("Please visit https://github.com/Exormeter/mgba/releases to obtain a compatible release and script")
+    console:log("Please visit https://github.com/Exormeter/mGBA_celio_edition/releases to obtain a compatible release and script")
     return
   end
   console:log("Registering SIO watchpoint")
