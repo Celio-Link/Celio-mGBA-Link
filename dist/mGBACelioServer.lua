@@ -1557,6 +1557,20 @@ local HandshakeState = {
   RESPONDING = 3
 }
 
+local Mode = {
+  MASTER = 0,
+  SLAVE = 1
+}
+
+local IE_REG = 0x200
+local IF_REG = 0x202
+
+local TM3CNT_L = 0x10C
+local TM3CNT_H = 0x10E
+
+local SIO_IRQ_IE_MASK = 0x80
+local SIO_IRQ_IF_MASK = 0x80
+
 local create_celio_device = function(emit_status_callback, emit_data_callback)
 
   local create_state = function(init)
@@ -1568,12 +1582,19 @@ local create_celio_device = function(emit_status_callback, emit_data_callback)
       _gba_reconnect = false,
       _keep_alive = true,
       _start_response = false,
+      _start_connect = false, --this field is only relevent in master mode
 
       _received_queue = {},
       _transmit_queue = {},
       _current_tx_command = {},
       _current_rx_command = {},
-      _empty_direction_streak = 0
+      _empty_direction_streak = 0,
+
+      _checksum = 0,
+
+      _masterState = {
+        timer_count = 0,
+      }
     }
     if (not init) then state._handshakeState = HandshakeState.LISTENING end
     return state
@@ -1584,32 +1605,106 @@ local create_celio_device = function(emit_status_callback, emit_data_callback)
   local celio_device = {
     state = create_state(true),
     emit_status = emit_status_callback,
-    emit_data = emit_data_callback
+    emit_data = emit_data_callback,
+    mode = Mode.SLAVE,
+    timer_enabled = false
   }
 
   --////////////////////////////////////////////////////////////////////////////////////////////////////////--
 
   function celio_device:transive(rx_value)
     if (celio_device.state._transive_state == Transive.HANDSHAKE) then
-      -- local tx_value = celio_device:transive_handshake(rx_value)
+      local tx_value = celio_device:transive_handshake(rx_value)
       -- console:log("Handshake - RX: " .. string.format("0x%x", rx_value) .. " TX: " .. string.format("0x%x", tx_value))
-      -- console:log("HandshakeState " .. tonumber(celio_device.state._handshakeState))
-      return celio_device:transive_handshake(rx_value)
+      --console:log("HandshakeState " .. tonumber(celio_device.state._handshakeState))
+      return tx_value
     end
     if (celio_device.state._transive_state == Transive.CRC) then
-      return celio_device:transive_crc(rx_value)
+      local tx_value = celio_device:transive_crc(rx_value)
+      --console:log("CRC - RX: " .. string.format("0x%x", rx_value) .. " TX: " .. string.format("0x%x", tx_value))
+      return tx_value
     end
     if (celio_device.state._transive_state == Transive.COMMAND) then
-      return celio_device:transive_command(rx_value)
+      local tx_value = celio_device:transive_command(rx_value)
+      --console:log("Command - RX: " .. string.format("0x%x", rx_value) .. " TX: " .. string.format("0x%x", tx_value))
+      return tx_value
     end
   end
 
   --////////////////////////////////////////////////////////////////////////////////////////////////////////--
 
+  function celio_device:enable_timer3()
+    if (celio_device.state._masterState.timer_enabled) then
+      return
+    end
+    celio_device.state._masterState.timer_enabled = true
+    emu.memory.io:write16(0x10C, 0xFED0); -- Tim3 Reload Counter | OV at 197 ticks
+    emu.memory.io:write16(TM3CNT_H, 0x00C1); -- Tim3 Enable | Request IRQ | 64 Prescaler
+  end
+
+    --////////////////////////////////////////////////////////////////////////////////////////////////////////--
+
+  function celio_device:disable_timer3()
+    celio_device.state._masterState.timer_enabled = false
+    celio_device.state._masterState.timer_count = 0
+    emu.memory.io:write16(TM3CNT_H, 0x0000);
+    emu.memory.io:write16(TM3CNT_L, 0x0000);
+  end
+
+  --////////////////////////////////////////////////////////////////////////////////////////////////////////--
+
+  function celio_device:sync_timer()
+    local ie_reg_value = emu.memory.io:read16(IE_REG)
+    if (celio_device.mode == Mode.SLAVE or (ie_reg_value & SIO_IRQ_IE_MASK) == 0) then
+      if (celio_device.state._masterState.timer_enabled) then
+        celio_device:disable_timer3()
+      end
+      return
+    end
+
+    local if_reg_value = emu.memory.io:read16(IF_REG)
+    if_reg_value = if_reg_value | SIO_IRQ_IF_MASK
+    emu.memory.io:write16(IF_REG, if_reg_value)
+    if (celio_device.state._transive_state == Transive.CRC) then
+      celio_device:enable_timer3()
+    end
+    return true
+  end
+
+  --////////////////////////////////////////////////////////////////////////////////////////////////////////--
+
+  function celio_device:transmission_timer()
+    local ie_reg_value = emu.memory.io:read16(IE_REG)
+    if (celio_device.mode == Mode.SLAVE or (ie_reg_value & SIO_IRQ_IE_MASK) == 0) then
+      return
+    end
+
+    local if_reg_value = emu.memory.io:read16(IF_REG)
+    if_reg_value = if_reg_value & 0xFFBF --Reset Tim3 irq IF
+    if_reg_value = if_reg_value | SIO_IRQ_IF_MASK
+    emu.memory.io:write16(IF_REG, if_reg_value)
+    if (celio_device.state._masterState.timer_count == 7) then
+      celio_device:disable_timer3()
+      celio_device.state._masterState.timer_count = 0
+    else
+       celio_device.state._masterState.timer_count = celio_device.state._masterState.timer_count + 1
+    end
+  end
+
+  --////////////////////////////////////////////////////////////////////////////////////////////////////////--
+
+  
   function celio_device:transive_handshake(rx_value)
+
     if (rx_value == 0xB9A0 and celio_device.state._handshakeState == HandshakeState.LISTENING) then
       celio_device.emit_status(LinkStatus.HandshakeReceived)
       celio_device.state._handshakeState = HandshakeState.WAITING_TO_RESPOND
+    end
+
+    if (celio_device.state._start_connect) then
+      celio_device.emit_status(LinkStatus.LinkConnected)
+      celio_device.state._transive_state = Transive.CRC
+      return 0x8FFF
     end
 
     if (rx_value == 0x8FFF) then
@@ -1654,10 +1749,14 @@ local create_celio_device = function(emit_status_callback, emit_data_callback)
         console:log("Emulated Device: Link closed")
         celio_device.emit_status(LinkStatus.LinkClosed)
       end
+      celio_device:disable_timer3()
     else
       celio_device.state._transive_state = Transive.COMMAND
     end
-    return rx_value
+
+    local checksum = celio_device.state._checksum
+    celio_device.state._checksum = 0
+    return checksum
   end
 
   --////////////////////////////////////////////////////////////////////////////////////////////////////////--
@@ -1765,7 +1864,11 @@ local create_celio_device = function(emit_status_callback, emit_data_callback)
       flush_rx_queue()
     end
 
-    return table.remove(celio_device.state._current_tx_command, 1)
+    local tx_value = table.remove(celio_device.state._current_tx_command, 1)
+    celio_device.state._checksum = (celio_device.state._checksum + tx_value) & 0xFFFF
+    celio_device.state._checksum = (celio_device.state._checksum + rx_value) & 0xFFFF
+
+    return tx_value
   end
 
   --////////////////////////////////////////////////////////////////////////////////////////////////////////--
@@ -1774,7 +1877,7 @@ local create_celio_device = function(emit_status_callback, emit_data_callback)
     if (command == CommandType.SetMode) then
       console:log("Emulated Device - Received Command: SetMode")
       celio_device.emit_status(LinkStatus.DeviceReady)
-      celio_device.emit_status(LinkStatus.AwaitModeEmulator)
+      celio_device.emit_status(LinkStatus.AwaitMode)
 
     elseif (command == CommandType.EmuSessionStart) then
       console:log("Emulated Device - Received Command: EmuSessionStart")
@@ -1783,14 +1886,25 @@ local create_celio_device = function(emit_status_callback, emit_data_callback)
     elseif (command == CommandType.SetModeSlave) then
       console:log("Emulated Device - Received Command: SetModeSlave")
       celio_device.state._handshakeState = HandshakeState.LISTENING
+      celio_device.mode = Mode.SLAVE
+      emu:setSioMaster()
 
     elseif (command == CommandType.SetModeMaster) then
-      console:error("master mode is currently not supported")
+      console:log("Emulated Device - Received Command: SetModeMaster")
+      celio_device.state._handshakeState = HandshakeState.LISTENING
+      celio_device.mode = Mode.MASTER
+      emu:setSioSlave()
 
     elseif (command == CommandType.StartHandshake) then
       console:log("Emulated Device - Received Command: StartHandshake")
       -- celio_device.state._handshakeState = HandshakeState.RESPONDING
       celio_device.state._start_response = true
+
+    elseif (command == CommandType.ConnectLink) then
+      celio_device.state._start_connect = true
+      console:log("Emulated Device - Received Command: ConnectLink")
+      
+
     else
       console:warn("Received unknown command " .. tostring(command))
     end
@@ -1809,6 +1923,7 @@ local create_celio_device = function(emit_status_callback, emit_data_callback)
 
   function celio_device:receive(message, opcode)
       if (opcode == require'websocket'.TEXT) then
+        console:log(message .. "")
         console:log("Received raw status: " .. string.format("0x%x", tonumber(message)))
         celio_device:receive_command(tonumber(message))
       elseif (opcode == require'websocket'.BINARY) then
@@ -1822,6 +1937,7 @@ end
 return {
   LinkStatus = LinkStatus,
   CommandType = CommandType,
+  Mode = Mode,
   create_celio_device = create_celio_device
 }
  end)
@@ -1935,34 +2051,62 @@ return {
 local celio_device_factory = require'celio_device'
 local celio_server_factory = require'celio_server'
 Direction = require('celio_server').Direction
+Mode = require('celio_device').Mode
 
 local celio_device = nil
 local server = nil
 local watchpointId = nil
 
-console:log("Celio-mGBA-Link Version 0.1")
+console:log("Celio-mGBA-Link Version 0.2")
 console:log("Waiting for emulation to start")
 
 local function start()
 
-  if (system.commit ~= "7c1fde50ad1c66d3c41cd25cb2ca5bdb6dbc5332") then
+  if (system.commit ~= "3da13060a586f2da8eb4ecbb167f642e2e4889c2") then
     console:error("This script is not comatible with the version of mGBA that it was loaded with.")
-    console:log("Please visit https://github.com/Exormeter/mgba/releases to obtain a compatible release and script")
+    console:log("Please visit https://github.com/Exormeter/mGBA_celio_edition/releases to obtain a compatible release and script")
     return
   end
   console:log("Registering SIO watchpoint")
 
-  watchpointId = emu:setWatchpoint(function ()
+  watchpointId = emu:setWatchpoint(
+    function ()
       local rx_value_current = emu.memory.io:read16(0x12A)
       if (celio_device == nil) then return end
       local tx_value_current = celio_device:transive(rx_value_current)
-      emu.memory.io:write16(0x120, rx_value_current)
-      emu.memory.io:write16(0x122, tx_value_current)
-      emu.memory.io:write16(0x124, 0xFFFF)
-      emu.memory.io:write16(0x126, 0xFFFF)
+      if (celio_device.mode == Mode.MASTER) then
+        emu.memory.io:write16(0x120, tx_value_current)
+        emu.memory.io:write16(0x122, rx_value_current)
+        emu.memory.io:write16(0x124, 0xFFFF)
+        emu.memory.io:write16(0x126, 0xFFFF)
+      else
+        emu.memory.io:write16(0x120, rx_value_current)
+        emu.memory.io:write16(0x122, tx_value_current)
+        emu.memory.io:write16(0x124, 0xFFFF)
+        emu.memory.io:write16(0x126, 0xFFFF)
+      end
+      
     end,
-    0x4000120,
+    0x4000122,
     C.WATCHPOINT_TYPE.READ
+  )
+
+  console:log("Registering vblanck IRQ callback")
+
+  callbacks:add("vblankIRQ",
+    function ()
+      if (celio_device == nil) then return end
+      celio_device:sync_timer()
+    end
+  )
+
+  console:log("Registering timer3 IRQ callback")
+
+  callbacks:add("timer3IRQ",
+    function ()
+      if (celio_device == nil) then return end
+      celio_device:transmission_timer()
+    end
   )
 
   console:log("Starting websocket server \n")
@@ -1989,6 +2133,11 @@ local function start()
         celio_device:receive_command(CommandType.EmuSessionStart)
 
         ws:set_on_message(function(ws, message, opcode)
+          if (opcode == require'websocket'.TEXT and message == "getVersion") then
+            console:log("Sending version info")
+            ws:send("0.2", require'websocket'.TEXT)
+            return
+          end
           celio_server:receive(Direction.CLIENT, message, opcode)
         end)
 
@@ -2002,6 +2151,11 @@ local function start()
         )
 
         ws:set_on_message(function(ws, message, opcode)
+          if (opcode == require'websocket'.TEXT and message == "getVersion") then
+            console:log("Sending version info")
+            ws:send("0.2", require'websocket'.TEXT)
+            return
+          end
           celio_device:receive(message, opcode)
         end)
       end,
