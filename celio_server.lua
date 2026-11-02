@@ -10,28 +10,34 @@ local create_celio_server = function (send)
 
   local celio_server = {
     _send = send,
-    _server = LinkStatus.AwaitMode,
-    _client = LinkStatus.AwaitMode,
+    _server = LinkStatus.AwaitPlayerSettings,
+    _client = LinkStatus.AwaitPlayerSettings,
   }
 
   --////////////////////////////////////////////////////////////////////////////////////////////////////////--
 
   function celio_server:checkSendStartHandshake()
     if (celio_server._server == LinkStatus.HandshakeReceived and celio_server._client == LinkStatus.HandshakeReceived) then
-      celio_server._send(Direction.CLIENT, tostring(CommandType.StartHandshake), require'websocket'.TEXT)
-      celio_server._send(Direction.SERVER, tostring(CommandType.StartHandshake), require'websocket'.TEXT)
+      celio_server._send(Direction.CLIENT, "command", { commandType = CommandType.StartHandshake })
+      celio_server._send(Direction.SERVER, "command", { CommandType.StartHandshake })
     end
   end
 
   --////////////////////////////////////////////////////////////////////////////////////////////////////////--
 
   function celio_server:receive_status(source, status)
-    if (status == LinkStatus.AwaitMode) then
-      console:log("Received status: AwaitMode")
+    console:log("Received raw status from " .. source .. ": " .. string.format("0x%x", status))
+
+    -- local link is always two players, the emulated GBA is the master in seat 0
+    if (status == LinkStatus.AwaitPlayerSettings) then
+      console:log("Received status: AwaitPlayerSettings")
       if (source == Direction.CLIENT) then
-        celio_server._send(Direction.CLIENT, tostring(CommandType.SetModeMaster), require'websocket'.TEXT)
+        celio_server._send(Direction.CLIENT, "command", {
+          commandType = CommandType.PlayerSettings,
+          args = { playerCount = 2, playerIndex = 1 }
+        })
       elseif (source == Direction.SERVER)  then
-        celio_server._send(Direction.SERVER, tostring(CommandType.SetModeSlave), require'websocket'.TEXT)
+        celio_server._send(Direction.SERVER, "command", { CommandType.PlayerSettings, 2, 0 })
       end
 
     elseif (status == LinkStatus.HandshakeReceived) then
@@ -47,10 +53,10 @@ local create_celio_server = function (send)
       console:log("Received status: LinkConnected")
       if (source == Direction.CLIENT) then
         celio_server._client = LinkStatus.LinkConnected
-        celio_server._send(Direction.SERVER, tostring(CommandType.ConnectLink), require'websocket'.TEXT)
+        celio_server._send(Direction.SERVER, "command", { CommandType.ConnectLink })
       elseif (source == Direction.SERVER)  then
         celio_server._server = LinkStatus.LinkConnected
-        celio_server._send(Direction.CLIENT, tostring(CommandType.ConnectLink), require'websocket'.TEXT)
+        celio_server._send(Direction.CLIENT, "command", { commandType = CommandType.ConnectLink })
       end
 
     elseif (status == LinkStatus.LinkReconnecting) then
@@ -73,27 +79,12 @@ local create_celio_server = function (send)
 
   --////////////////////////////////////////////////////////////////////////////////////////////////////////--
 
+  -- data is a byte array of packets [seat, 8 little endian words]
   function celio_server:receive_data(source, data)
     if (source == Direction.SERVER) then
-      celio_server._send(Direction.CLIENT, data, require'websocket'.BINARY)
+      celio_server._send(Direction.CLIENT, "data", data)
     elseif (source == Direction.CLIENT) then
-      celio_server._send(Direction.SERVER, data, require'websocket'.BINARY)
-    end
-  end
-
-  --////////////////////////////////////////////////////////////////////////////////////////////////////////--
-
-  function celio_server:receive(source, message, opcode)
-    if (opcode == require'websocket'.TEXT) then
-      if (source == Direction.SERVER) then
-        console:log("Received raw status from emulated device: " .. string.format("0x%x", tonumber(message)))
-      end
-      if (source == Direction.CLIENT) then 
-        console:log("Received raw status from connected device: " .. string.format("0x%x", tonumber(message)))
-      end
-      celio_server:receive_status(source, tonumber(message))
-    elseif (opcode == require'websocket'.BINARY) then
-      celio_server:receive_data(source, message)
+      celio_server._send(Direction.SERVER, "data", data)
     end
   end
 

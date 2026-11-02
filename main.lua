@@ -7,7 +7,7 @@ local celio_device = nil
 local server = nil
 local watchpointId = nil
 
-console:log("Celio-mGBA-Link Version 0.2")
+console:log("Celio-mGBA-Link Version 0.3")
 console:log("Waiting for emulation to start")
 
 local function start()
@@ -23,19 +23,21 @@ local function start()
     function ()
       local rx_value_current = emu.memory.io:read16(0x12A)
       if (celio_device == nil) then return end
-      local tx_value_current = celio_device:transive(rx_value_current)
-      if (celio_device.mode == Mode.MASTER) then
-        emu.memory.io:write16(0x120, tx_value_current)
-        emu.memory.io:write16(0x122, rx_value_current)
-        emu.memory.io:write16(0x124, 0xFFFF)
-        emu.memory.io:write16(0x126, 0xFFFF)
-      else
-        emu.memory.io:write16(0x120, rx_value_current)
-        emu.memory.io:write16(0x122, tx_value_current)
-        emu.memory.io:write16(0x124, 0xFFFF)
-        emu.memory.io:write16(0x126, 0xFFFF)
+      local tx_values_current = celio_device:transive(rx_value_current)
+
+      -- SIOMULTI0-3 hold the value of each seat, the partners values are in ascending seat order, unused seats are 0xFFFF
+      local tx_index = 1
+      for seat = 0, 3 do
+        local value = 0xFFFF
+        if (seat == celio_device.seat) then
+          value = rx_value_current
+        elseif (seat < celio_device.player_count) then
+          value = tx_values_current[tx_index]
+          tx_index = tx_index + 1
+        end
+        emu.memory.io:write16(0x120 + seat * 2, value)
       end
-      
+
     end,
     0x4000122,
     C.WATCHPOINT_TYPE.READ
@@ -67,28 +69,49 @@ local function start()
     protocols = {
       celio_local = function(ws)
 
-        local celio_server = celio_server_factory.create_celio_server(function(dest, message, opcode)
+        -- only messages to the client are json encoded, the emulated device is called directly
+        local celio_server = celio_server_factory.create_celio_server(function(dest, msg_type, body)
           if (dest == Direction.SERVER and celio_device ~= nil) then
-            celio_device:receive(message, opcode)
+            if (msg_type == "command") then
+              celio_device:receive_command(body)
+            elseif (msg_type == "data") then
+              celio_device:receive_data(body)
+            end
           elseif (dest == Direction.CLIENT) then
-            ws:send(message, opcode)
+            ws:send(require'json'.encode({ type = msg_type, body = body }), require'websocket'.TEXT)
           end
         end)
 
         celio_device = celio_device_factory.create_celio_device(
-          function(message) celio_server:receive(Direction.SERVER, tostring(message), require'websocket'.TEXT) end,
-          function(message) celio_server:receive(Direction.SERVER, message, require'websocket'.BINARY) end
+          function(status) celio_server:receive_status(Direction.SERVER, status) end,
+          function(data) celio_server:receive_data(Direction.SERVER, { string.byte(data, 1, -1) }) end
         )
 
-        celio_device:receive_command(CommandType.EmuSessionStart)
+        celio_device:receive_command({ CommandType.EmuSessionStart })
 
         ws:set_on_message(function(ws, message, opcode)
-          if (opcode == require'websocket'.TEXT and message == "getVersion") then
+          -- legacy version check of clients that predate the json protocol
+          if (message == "getVersion") then
             console:log("Sending version info")
-            ws:send("0.2", require'websocket'.TEXT)
+            ws:send("0.3", require'websocket'.TEXT)
             return
           end
-          celio_server:receive(Direction.CLIENT, message, opcode)
+
+          local msg = require'json'.decode(message)
+
+          if (msg.type == "versionRequest") then
+            console:log("Sending version info")
+            ws:send(require'json'.encode({ type = "version", body = "0.3" }), require'websocket'.TEXT)
+
+          elseif (msg.type == "status") then
+            celio_server:receive_status(Direction.CLIENT, msg.body)
+
+          elseif (msg.type == "data") then
+            celio_server:receive_data(Direction.CLIENT, msg.body)
+            
+          else
+            console:warn("Ignoring message type: " .. tostring(msg.type))
+          end
         end)
 
       end,
@@ -96,17 +119,75 @@ local function start()
       celio_online = function(ws)
 
         celio_device = require'celio_device'.create_celio_device(
-          function(message) ws:send(tostring(message), require'websocket'.TEXT) end,
-          function(message) ws:send(message, require'websocket'.BINARY) end
+          function(status)
+            ws:send(require'json'.encode({ type = "status", body = status }), require'websocket'.TEXT)
+          end,
+          function(data)
+            local body = { string.byte(data, 1, -1) }
+            ws:send(require'json'.encode({ type = "data", body = body }), require'websocket'.TEXT)
+          end
         )
 
         ws:set_on_message(function(ws, message, opcode)
-          if (opcode == require'websocket'.TEXT and message == "getVersion") then
-            console:log("Sending version info")
-            ws:send("0.2", require'websocket'.TEXT)
+          if (opcode ~= require'websocket'.TEXT) then
+            console:warn("Ignoring non-text message")
             return
           end
-          celio_device:receive(message, opcode)
+
+          -- legacy version check of clients that predate the json protocol
+          if (message == "getVersion") then
+            console:log("Sending version info")
+            ws:send("0.3", require'websocket'.TEXT)
+            return
+          end
+
+          local ok, msg = pcall(require'json'.decode, message)
+          if (not ok or type(msg) ~= "table") then
+            console:warn("Ignoring invalid json: " .. tostring(message))
+            return
+          end
+
+          if (type(msg.type) ~= "string") then
+            console:warn("Ignoring message without type: " .. message)
+            return
+          end
+
+          local msg_type = msg.type
+
+          if (msg_type == "versionRequest") then
+            console:log("Sending version info")
+            ws:send(require'json'.encode({ type = "version", body = "0.3" }), require'websocket'.TEXT)
+            return
+          end
+
+          local body = {}
+          if (msg.body ~= nil) then
+            if (type(msg.body) ~= "table") then
+              console:warn("Ignoring message with invalid body: " .. message)
+              return
+            end
+            for i = 1, #msg.body do
+              local value = math.tointeger(msg.body[i])
+              if (value == nil or value < 0 or value > 0xFF) then
+                console:warn("Ignoring message with non uint8 body value: " .. message)
+                return
+              end
+              body[i] = value
+            end
+          end
+
+          if (msg_type == "command") then
+            celio_device:receive_command(body)
+            return
+          end
+
+          if (msg_type == "data") then
+            celio_device:receive_data(body)
+            return
+          end
+
+          console:warn("Ignoring message type: " .. msg_type)
+
         end)
       end,
     }

@@ -1515,11 +1515,401 @@ return {
   PONG = frame.PONG
 }
  end)
+package.preload['json'] = (function (...)
+--
+-- json.lua
+--
+-- Copyright (c) 2020 rxi
+--
+-- Permission is hereby granted, free of charge, to any person obtaining a copy of
+-- this software and associated documentation files (the "Software"), to deal in
+-- the Software without restriction, including without limitation the rights to
+-- use, copy, modify, merge, publish, distribute, sublicense, and/or sell copies
+-- of the Software, and to permit persons to whom the Software is furnished to do
+-- so, subject to the following conditions:
+--
+-- The above copyright notice and this permission notice shall be included in all
+-- copies or substantial portions of the Software.
+--
+-- THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+-- IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+-- FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+-- AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+-- LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+-- OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+-- SOFTWARE.
+--
+
+local json = { _version = "0.1.2" }
+
+-------------------------------------------------------------------------------
+-- Encode
+-------------------------------------------------------------------------------
+
+local encode
+
+local escape_char_map = {
+  [ "\\" ] = "\\",
+  [ "\"" ] = "\"",
+  [ "\b" ] = "b",
+  [ "\f" ] = "f",
+  [ "\n" ] = "n",
+  [ "\r" ] = "r",
+  [ "\t" ] = "t",
+}
+
+local escape_char_map_inv = { [ "/" ] = "/" }
+for k, v in pairs(escape_char_map) do
+  escape_char_map_inv[v] = k
+end
+
+
+local function escape_char(c)
+  return "\\" .. (escape_char_map[c] or string.format("u%04x", c:byte()))
+end
+
+
+local function encode_nil(val)
+  return "null"
+end
+
+
+local function encode_table(val, stack)
+  local res = {}
+  stack = stack or {}
+
+  -- Circular reference?
+  if stack[val] then error("circular reference") end
+
+  stack[val] = true
+
+  if rawget(val, 1) ~= nil or next(val) == nil then
+    -- Treat as array -- check keys are valid and it is not sparse
+    local n = 0
+    for k in pairs(val) do
+      if type(k) ~= "number" then
+        error("invalid table: mixed or invalid key types")
+      end
+      n = n + 1
+    end
+    if n ~= #val then
+      error("invalid table: sparse array")
+    end
+    -- Encode
+    for i, v in ipairs(val) do
+      table.insert(res, encode(v, stack))
+    end
+    stack[val] = nil
+    return "[" .. table.concat(res, ",") .. "]"
+
+  else
+    -- Treat as an object
+    for k, v in pairs(val) do
+      if type(k) ~= "string" then
+        error("invalid table: mixed or invalid key types")
+      end
+      table.insert(res, encode(k, stack) .. ":" .. encode(v, stack))
+    end
+    stack[val] = nil
+    return "{" .. table.concat(res, ",") .. "}"
+  end
+end
+
+
+local function encode_string(val)
+  return '"' .. val:gsub('[%z\1-\31\\"]', escape_char) .. '"'
+end
+
+
+local function encode_number(val)
+  -- Check for NaN, -inf and inf
+  if val ~= val or val <= -math.huge or val >= math.huge then
+    error("unexpected number value '" .. tostring(val) .. "'")
+  end
+  return string.format("%.14g", val)
+end
+
+
+local type_func_map = {
+  [ "nil"     ] = encode_nil,
+  [ "table"   ] = encode_table,
+  [ "string"  ] = encode_string,
+  [ "number"  ] = encode_number,
+  [ "boolean" ] = tostring,
+}
+
+
+encode = function(val, stack)
+  local t = type(val)
+  local f = type_func_map[t]
+  if f then
+    return f(val, stack)
+  end
+  error("unexpected type '" .. t .. "'")
+end
+
+
+function json.encode(val)
+  return ( encode(val) )
+end
+
+
+-------------------------------------------------------------------------------
+-- Decode
+-------------------------------------------------------------------------------
+
+local parse
+
+local function create_set(...)
+  local res = {}
+  for i = 1, select("#", ...) do
+    res[ select(i, ...) ] = true
+  end
+  return res
+end
+
+local space_chars   = create_set(" ", "\t", "\r", "\n")
+local delim_chars   = create_set(" ", "\t", "\r", "\n", "]", "}", ",")
+local escape_chars  = create_set("\\", "/", '"', "b", "f", "n", "r", "t", "u")
+local literals      = create_set("true", "false", "null")
+
+local literal_map = {
+  [ "true"  ] = true,
+  [ "false" ] = false,
+  [ "null"  ] = nil,
+}
+
+
+local function next_char(str, idx, set, negate)
+  for i = idx, #str do
+    if set[str:sub(i, i)] ~= negate then
+      return i
+    end
+  end
+  return #str + 1
+end
+
+
+local function decode_error(str, idx, msg)
+  local line_count = 1
+  local col_count = 1
+  for i = 1, idx - 1 do
+    col_count = col_count + 1
+    if str:sub(i, i) == "\n" then
+      line_count = line_count + 1
+      col_count = 1
+    end
+  end
+  error( string.format("%s at line %d col %d", msg, line_count, col_count) )
+end
+
+
+local function codepoint_to_utf8(n)
+  -- http://scripts.sil.org/cms/scripts/page.php?site_id=nrsi&id=iws-appendixa
+  local f = math.floor
+  if n <= 0x7f then
+    return string.char(n)
+  elseif n <= 0x7ff then
+    return string.char(f(n / 64) + 192, n % 64 + 128)
+  elseif n <= 0xffff then
+    return string.char(f(n / 4096) + 224, f(n % 4096 / 64) + 128, n % 64 + 128)
+  elseif n <= 0x10ffff then
+    return string.char(f(n / 262144) + 240, f(n % 262144 / 4096) + 128,
+                       f(n % 4096 / 64) + 128, n % 64 + 128)
+  end
+  error( string.format("invalid unicode codepoint '%x'", n) )
+end
+
+
+local function parse_unicode_escape(s)
+  local n1 = tonumber( s:sub(1, 4),  16 )
+  local n2 = tonumber( s:sub(7, 10), 16 )
+   -- Surrogate pair?
+  if n2 then
+    return codepoint_to_utf8((n1 - 0xd800) * 0x400 + (n2 - 0xdc00) + 0x10000)
+  else
+    return codepoint_to_utf8(n1)
+  end
+end
+
+
+local function parse_string(str, i)
+  local res = ""
+  local j = i + 1
+  local k = j
+
+  while j <= #str do
+    local x = str:byte(j)
+
+    if x < 32 then
+      decode_error(str, j, "control character in string")
+
+    elseif x == 92 then -- `\`: Escape
+      res = res .. str:sub(k, j - 1)
+      j = j + 1
+      local c = str:sub(j, j)
+      if c == "u" then
+        local hex = str:match("^[dD][89aAbB]%x%x\\u%x%x%x%x", j + 1)
+                 or str:match("^%x%x%x%x", j + 1)
+                 or decode_error(str, j - 1, "invalid unicode escape in string")
+        res = res .. parse_unicode_escape(hex)
+        j = j + #hex
+      else
+        if not escape_chars[c] then
+          decode_error(str, j - 1, "invalid escape char '" .. c .. "' in string")
+        end
+        res = res .. escape_char_map_inv[c]
+      end
+      k = j + 1
+
+    elseif x == 34 then -- `"`: End of string
+      res = res .. str:sub(k, j - 1)
+      return res, j + 1
+    end
+
+    j = j + 1
+  end
+
+  decode_error(str, i, "expected closing quote for string")
+end
+
+
+local function parse_number(str, i)
+  local x = next_char(str, i, delim_chars)
+  local s = str:sub(i, x - 1)
+  local n = tonumber(s)
+  if not n then
+    decode_error(str, i, "invalid number '" .. s .. "'")
+  end
+  return n, x
+end
+
+
+local function parse_literal(str, i)
+  local x = next_char(str, i, delim_chars)
+  local word = str:sub(i, x - 1)
+  if not literals[word] then
+    decode_error(str, i, "invalid literal '" .. word .. "'")
+  end
+  return literal_map[word], x
+end
+
+
+local function parse_array(str, i)
+  local res = {}
+  local n = 1
+  i = i + 1
+  while 1 do
+    local x
+    i = next_char(str, i, space_chars, true)
+    -- Empty / end of array?
+    if str:sub(i, i) == "]" then
+      i = i + 1
+      break
+    end
+    -- Read token
+    x, i = parse(str, i)
+    res[n] = x
+    n = n + 1
+    -- Next token
+    i = next_char(str, i, space_chars, true)
+    local chr = str:sub(i, i)
+    i = i + 1
+    if chr == "]" then break end
+    if chr ~= "," then decode_error(str, i, "expected ']' or ','") end
+  end
+  return res, i
+end
+
+
+local function parse_object(str, i)
+  local res = {}
+  i = i + 1
+  while 1 do
+    local key, val
+    i = next_char(str, i, space_chars, true)
+    -- Empty / end of object?
+    if str:sub(i, i) == "}" then
+      i = i + 1
+      break
+    end
+    -- Read key
+    if str:sub(i, i) ~= '"' then
+      decode_error(str, i, "expected string for key")
+    end
+    key, i = parse(str, i)
+    -- Read ':' delimiter
+    i = next_char(str, i, space_chars, true)
+    if str:sub(i, i) ~= ":" then
+      decode_error(str, i, "expected ':' after key")
+    end
+    i = next_char(str, i + 1, space_chars, true)
+    -- Read value
+    val, i = parse(str, i)
+    -- Set
+    res[key] = val
+    -- Next token
+    i = next_char(str, i, space_chars, true)
+    local chr = str:sub(i, i)
+    i = i + 1
+    if chr == "}" then break end
+    if chr ~= "," then decode_error(str, i, "expected '}' or ','") end
+  end
+  return res, i
+end
+
+
+local char_func_map = {
+  [ '"' ] = parse_string,
+  [ "0" ] = parse_number,
+  [ "1" ] = parse_number,
+  [ "2" ] = parse_number,
+  [ "3" ] = parse_number,
+  [ "4" ] = parse_number,
+  [ "5" ] = parse_number,
+  [ "6" ] = parse_number,
+  [ "7" ] = parse_number,
+  [ "8" ] = parse_number,
+  [ "9" ] = parse_number,
+  [ "-" ] = parse_number,
+  [ "t" ] = parse_literal,
+  [ "f" ] = parse_literal,
+  [ "n" ] = parse_literal,
+  [ "[" ] = parse_array,
+  [ "{" ] = parse_object,
+}
+
+
+parse = function(str, idx)
+  local chr = str:sub(idx, idx)
+  local f = char_func_map[chr]
+  if f then
+    return f(str, idx)
+  end
+  decode_error(str, idx, "unexpected character '" .. chr .. "'")
+end
+
+
+function json.decode(str)
+  if type(str) ~= "string" then
+    error("expected argument of type string, got " .. type(str))
+  end
+  local res, idx = parse(str, next_char(str, 1, space_chars, true))
+  idx = next_char(str, idx, space_chars, true)
+  if idx <= #str then
+    decode_error(str, idx, "trailing garbage")
+  end
+  return res
+end
+
+
+return json
+ end)
 package.preload['celio_device'] = (function (...)
 
 local LinkStatus = {
   AwaitModeEmulator = 0xFF01,
-  AwaitMode = 0xFF02,
+  AwaitPlayerSettings = 0xFF02,
   HandshakeReceived = 0xFF03,
   HandshakeFinished = 0xFF04,
   LinkConnected = 0xFF05,
@@ -1536,8 +1926,7 @@ local LinkStatus = {
 local CommandType = {
   SetMode = 0x00,
   Cancel = 0x01,
-  SetModeMaster = 0x10,
-  SetModeSlave = 0x11,
+  PlayerSettings = 0x10,
   StartHandshake = 0x12,
   ConnectLink = 0x13,
 
@@ -1571,6 +1960,9 @@ local TM3CNT_H = 0x10E
 local SIO_IRQ_IE_MASK = 0x80
 local SIO_IRQ_IF_MASK = 0x80
 
+local PACKET_SIZE = 17 -- seat byte + 8 little endian words
+local MAX_BUFFERED_PACKETS = 3
+
 local create_celio_device = function(emit_status_callback, emit_data_callback)
 
   local create_state = function(init)
@@ -1584,10 +1976,11 @@ local create_celio_device = function(emit_status_callback, emit_data_callback)
       _start_response = false,
       _start_connect = false, --this field is only relevent in master mode
 
-      _received_queue = {},
-      _transmit_queue = {},
-      _current_tx_command = {},
+      _received_queues = {}, -- received words, keyed by seat of the partner
+      _transmit_queue = {}, -- rx commands of the GBA waiting to be flushed
+      _current_tx_commands = {}, -- one command per partner, in ascending seat order
       _current_rx_command = {},
+      _partner_reconnect = {},
       _empty_direction_streak = 0,
 
       _checksum = 0,
@@ -1607,27 +2000,50 @@ local create_celio_device = function(emit_status_callback, emit_data_callback)
     emit_status = emit_status_callback,
     emit_data = emit_data_callback,
     mode = Mode.SLAVE,
-    timer_enabled = false
+    timer_enabled = false,
+    player_count = 2,
+    seat = 0 -- seat of the emulated GBA, seat 0 is the master
   }
+
+  --////////////////////////////////////////////////////////////////////////////////////////////////////////--
+
+  -- Seats of all other players in ascending order, which is the order their values are transmitted in
+  function celio_device:partner_seats()
+    local seats = {}
+    for seat = 0, celio_device.player_count - 1 do
+      if (seat ~= celio_device.seat) then table.insert(seats, seat) end
+    end
+    return seats
+  end
+
+  --////////////////////////////////////////////////////////////////////////////////////////////////////////--
+
+  local for_each_partner = function (value)
+    local values = {}
+    for i = 1, celio_device.player_count - 1 do
+      values[i] = value
+    end
+    return values
+  end
 
   --////////////////////////////////////////////////////////////////////////////////////////////////////////--
 
   function celio_device:transive(rx_value)
     if (celio_device.state._transive_state == Transive.HANDSHAKE) then
-      local tx_value = celio_device:transive_handshake(rx_value)
+      local tx_values = celio_device:transive_handshake(rx_value)
       -- console:log("Handshake - RX: " .. string.format("0x%x", rx_value) .. " TX: " .. string.format("0x%x", tx_value))
       --console:log("HandshakeState " .. tonumber(celio_device.state._handshakeState))
-      return tx_value
+      return tx_values
     end
     if (celio_device.state._transive_state == Transive.CRC) then
-      local tx_value = celio_device:transive_crc(rx_value)
+      local tx_values = celio_device:transive_crc(rx_value)
       --console:log("CRC - RX: " .. string.format("0x%x", rx_value) .. " TX: " .. string.format("0x%x", tx_value))
-      return tx_value
+      return tx_values
     end
     if (celio_device.state._transive_state == Transive.COMMAND) then
-      local tx_value = celio_device:transive_command(rx_value)
+      local tx_values = celio_device:transive_command(rx_value)
       --console:log("Command - RX: " .. string.format("0x%x", rx_value) .. " TX: " .. string.format("0x%x", tx_value))
-      return tx_value
+      return tx_values
     end
   end
 
@@ -1701,10 +2117,13 @@ local create_celio_device = function(emit_status_callback, emit_data_callback)
       celio_device.state._handshakeState = HandshakeState.WAITING_TO_RESPOND
     end
 
+    -- the master (seat 0) is always the first partner, it sends the master handshake while the others keep responding
     if (celio_device.state._start_connect) then
       celio_device.emit_status(LinkStatus.LinkConnected)
       celio_device.state._transive_state = Transive.CRC
-      return 0x8FFF
+      local tx_values = for_each_partner(0xB9A0)
+      tx_values[1] = 0x8FFF
+      return tx_values
     end
 
     if (rx_value == 0x8FFF) then
@@ -1713,26 +2132,37 @@ local create_celio_device = function(emit_status_callback, emit_data_callback)
     end
 
     if (celio_device.state._handshakeState == HandshakeState.RESPONDING) then
-      return 0xB9A0
+      return for_each_partner(0xB9A0)
     end
 
     -- Fixes a race condition between setting RESPONDING and WAIT_TO_RESPONSE, to lazy to do it in a sane way
     if (celio_device.state._start_response) then celio_device.state._handshakeState = HandshakeState.RESPONDING end
 
-    return  0xD15E
+    return for_each_partner(0xD15E)
   end
 
   --////////////////////////////////////////////////////////////////////////////////////////////////////////--
 
+  -- Sends the queued commands as packets of [seat, 8 little endian words], same format as received
   local flush_rx_queue = function ()
+    if (#celio_device.state._transmit_queue == 0) then return end
     console:log("Flusing rx queue")
-    for i = #celio_device.state._transmit_queue, 32 do
-      table.insert(celio_device.state._transmit_queue, 0x00)
+
+    -- always send MAX_BUFFERED_PACKETS like the device does, padded with empty commands from the own seat
+    while (#celio_device.state._transmit_queue < MAX_BUFFERED_PACKETS) do
+      table.insert(celio_device.state._transmit_queue, {0,0,0,0,0,0,0,0})
     end
-    local fmt = ">" .. string.rep("I2", #celio_device.state._transmit_queue)
-    local data = string.pack(fmt, table.unpack(celio_device.state._transmit_queue))
+
+    local bytes = {}
+    for _, command in ipairs(celio_device.state._transmit_queue) do
+      table.insert(bytes, celio_device.seat)
+      for _, word in ipairs(command) do
+        table.insert(bytes, word & 0xFF)
+        table.insert(bytes, (word >> 8) & 0xFF)
+      end
+    end
     celio_device.state._transmit_queue = {}
-    celio_device.emit_data(data)
+    celio_device.emit_data(string.char(table.unpack(bytes)))
   end
 
   --////////////////////////////////////////////////////////////////////////////////////////////////////////--
@@ -1756,7 +2186,7 @@ local create_celio_device = function(emit_status_callback, emit_data_callback)
 
     local checksum = celio_device.state._checksum
     celio_device.state._checksum = 0
-    return checksum
+    return for_each_partner(checksum)
   end
 
   --////////////////////////////////////////////////////////////////////////////////////////////////////////--
@@ -1781,15 +2211,18 @@ local create_celio_device = function(emit_status_callback, emit_data_callback)
 
   --////////////////////////////////////////////////////////////////////////////////////////////////////////--
 
-  local load_tx_command = function ()
-    if (#celio_device.state._received_queue == 0) then
-      celio_device.state._current_tx_command = {0,0,0,0,0,0,0,0}
-    else
-      for i = 1, 8 do
-        local dequeued_value = table.remove(celio_device.state._received_queue, 1)
-        local swapped = ((dequeued_value >> 8) | (dequeued_value << 8)) & 0xFFFF
-        table.insert(celio_device.state._current_tx_command, swapped)
+  local load_tx_commands = function ()
+    celio_device.state._current_tx_commands = {}
+    for i, seat in ipairs(celio_device:partner_seats()) do
+      local queue = celio_device.state._received_queues[seat] or {}
+      local command = {0,0,0,0,0,0,0,0}
+      if (#queue > 0) then
+        command = {}
+        for j = 1, 8 do
+          table.insert(command, table.remove(queue, 1))
+        end
       end
+      celio_device.state._current_tx_commands[i] = command
     end
   end
 
@@ -1823,10 +2256,7 @@ local create_celio_device = function(emit_status_callback, emit_data_callback)
 
     if (queue_command) then
       print_command_db("rx command ", celio_device.state._current_rx_command)
-      for i = 1, 8 do
-        local dequeued_value = table.remove(celio_device.state._current_rx_command, 1)
-        table.insert(celio_device.state._transmit_queue, dequeued_value)
-      end
+      table.insert(celio_device.state._transmit_queue, celio_device.state._current_rx_command)
     end
 
     celio_device.state._current_rx_command = {}
@@ -1838,16 +2268,21 @@ local create_celio_device = function(emit_status_callback, emit_data_callback)
 
     table.insert(celio_device.state._current_rx_command, rx_value)
 
-    if (#celio_device.state._current_tx_command == 0) then
-      load_tx_command()
-      if (celio_device.state._current_tx_command[1] == 0xcafe and celio_device.state._current_tx_command[2] == 0x0017) then
-        celio_device.state._keep_alive = false
+    if (#celio_device.state._current_tx_commands == 0 or #celio_device.state._current_tx_commands[1] == 0) then
+      load_tx_commands()
+      local all_partners_reconnect = true
+      for i, command in ipairs(celio_device.state._current_tx_commands) do
+        if (command[1] == 0xcafe and command[2] == 0x0017) then
+          celio_device.state._keep_alive = false
+        end
+        if (command[1] == 0x5fff and not celio_device.state._partner_reconnect[i]) then
+          console:log("Emulated Device: Partner " .. tostring(i) .. " ready for reconnect")
+          celio_device.state._partner_reconnect[i] = true
+        end
+        all_partners_reconnect = all_partners_reconnect and celio_device.state._partner_reconnect[i] == true
+        print_command_db("tx command " .. tostring(i) .. " ", command)
       end
-      if (celio_device.state._current_tx_command[1] == 0x5fff) then
-        console:log("Emulated Device: Partner ready for reconnect")
-        celio_device.state._emu_reconnect = true
-      end
-      print_command_db("tx command ", celio_device.state._current_tx_command)
+      celio_device.state._emu_reconnect = all_partners_reconnect
     end
 
     if (#celio_device.state._current_rx_command == 8) then
@@ -1860,49 +2295,58 @@ local create_celio_device = function(emit_status_callback, emit_data_callback)
       celio_device.state._transive_state = Transive.CRC
     end
 
-    if (#celio_device.state._transmit_queue >= 32) then
+    if (#celio_device.state._transmit_queue >= MAX_BUFFERED_PACKETS) then
       flush_rx_queue()
     end
 
-    local tx_value = table.remove(celio_device.state._current_tx_command, 1)
-    celio_device.state._checksum = (celio_device.state._checksum + tx_value) & 0xFFFF
+    local tx_values = {}
+    for i, command in ipairs(celio_device.state._current_tx_commands) do
+      tx_values[i] = table.remove(command, 1)
+      celio_device.state._checksum = (celio_device.state._checksum + tx_values[i]) & 0xFFFF
+    end
     celio_device.state._checksum = (celio_device.state._checksum + rx_value) & 0xFFFF
 
-    return tx_value
+    return tx_values
   end
 
   --////////////////////////////////////////////////////////////////////////////////////////////////////////--
 
   function celio_device:receive_command(command)
-    if (command == CommandType.SetMode) then
+    local commandType = command[1]
+
+    if (commandType == CommandType.SetMode) then
       console:log("Emulated Device - Received Command: SetMode")
       celio_device.emit_status(LinkStatus.DeviceReady)
-      celio_device.emit_status(LinkStatus.AwaitMode)
+      celio_device.emit_status(LinkStatus.AwaitPlayerSettings)
 
-    elseif (command == CommandType.EmuSessionStart) then
+    elseif (commandType == CommandType.EmuSessionStart) then
       console:log("Emulated Device - Received Command: EmuSessionStart")
-      celio_device.emit_status(LinkStatus.AwaitMode)
+      celio_device.emit_status(LinkStatus.AwaitPlayerSettings)
 
-    elseif (command == CommandType.SetModeSlave) then
-      console:log("Emulated Device - Received Command: SetModeSlave")
+    elseif (commandType == CommandType.PlayerSettings) then
+      celio_device.player_count = command[2]
+      celio_device.seat = command[3]
+      console:log("Emulated Device - Received Command: PlayerSettings, player count "
+        .. tostring(celio_device.player_count) .. ", seat " .. tostring(celio_device.seat))
       celio_device.state._handshakeState = HandshakeState.LISTENING
-      celio_device.mode = Mode.SLAVE
-      emu:setSioMaster()
+      -- the emulated GBA in seat 0 is the master, so the device has to act as slave and vice versa
+      if (celio_device.seat == 0) then
+        celio_device.mode = Mode.SLAVE
+        emu:setSioMaster()
+      else
+        celio_device.mode = Mode.MASTER
+        emu:setSioSlave()
+      end
 
-    elseif (command == CommandType.SetModeMaster) then
-      console:log("Emulated Device - Received Command: SetModeMaster")
-      celio_device.state._handshakeState = HandshakeState.LISTENING
-      celio_device.mode = Mode.MASTER
-      emu:setSioSlave()
-
-    elseif (command == CommandType.StartHandshake) then
+    elseif (commandType == CommandType.StartHandshake) then
       console:log("Emulated Device - Received Command: StartHandshake")
       -- celio_device.state._handshakeState = HandshakeState.RESPONDING
       celio_device.state._start_response = true
 
-    elseif (command == CommandType.ConnectLink) then
-      celio_device.state._start_connect = true
+    elseif (commandType == CommandType.ConnectLink) then
       console:log("Emulated Device - Received Command: ConnectLink")
+      -- as seat 0 the emulated GBA sends the master handshake itself
+      if (celio_device.seat ~= 0) then celio_device.state._start_connect = true end
       
 
     else
@@ -1912,24 +2356,21 @@ local create_celio_device = function(emit_status_callback, emit_data_callback)
 
   --////////////////////////////////////////////////////////////////////////////////////////////////////////--
 
+  -- data is a list of packets [seat, 8 little endian words], each word is queued for the seat it came from
   function celio_device:receive_data(data)
-    for i = 1, #data, 2 do
-      local value = string.unpack(">I2", data, i)
-      table.insert(celio_device.state._received_queue, value)
+    for offset = 1, #data - PACKET_SIZE + 1, PACKET_SIZE do
+      local seat = data[offset]
+      if (seat ~= celio_device.seat and seat < celio_device.player_count) then
+        local queue = celio_device.state._received_queues[seat] or {}
+        celio_device.state._received_queues[seat] = queue
+        for i = offset + 1, offset + PACKET_SIZE - 1, 2 do
+          table.insert(queue, data[i] | (data[i + 1] << 8))
+        end
       end
+    end
   end
 
   --////////////////////////////////////////////////////////////////////////////////////////////////////////--
-
-  function celio_device:receive(message, opcode)
-      if (opcode == require'websocket'.TEXT) then
-        console:log(message .. "")
-        console:log("Received raw status: " .. string.format("0x%x", tonumber(message)))
-        celio_device:receive_command(tonumber(message))
-      elseif (opcode == require'websocket'.BINARY) then
-        celio_device:receive_data(message)
-      end
-    end
 
   return celio_device
 end
@@ -1954,28 +2395,34 @@ local create_celio_server = function (send)
 
   local celio_server = {
     _send = send,
-    _server = LinkStatus.AwaitMode,
-    _client = LinkStatus.AwaitMode,
+    _server = LinkStatus.AwaitPlayerSettings,
+    _client = LinkStatus.AwaitPlayerSettings,
   }
 
   --////////////////////////////////////////////////////////////////////////////////////////////////////////--
 
   function celio_server:checkSendStartHandshake()
     if (celio_server._server == LinkStatus.HandshakeReceived and celio_server._client == LinkStatus.HandshakeReceived) then
-      celio_server._send(Direction.CLIENT, tostring(CommandType.StartHandshake), require'websocket'.TEXT)
-      celio_server._send(Direction.SERVER, tostring(CommandType.StartHandshake), require'websocket'.TEXT)
+      celio_server._send(Direction.CLIENT, "command", { commandType = CommandType.StartHandshake })
+      celio_server._send(Direction.SERVER, "command", { CommandType.StartHandshake })
     end
   end
 
   --////////////////////////////////////////////////////////////////////////////////////////////////////////--
 
   function celio_server:receive_status(source, status)
-    if (status == LinkStatus.AwaitMode) then
-      console:log("Received status: AwaitMode")
+    console:log("Received raw status from " .. source .. ": " .. string.format("0x%x", status))
+
+    -- local link is always two players, the emulated GBA is the master in seat 0
+    if (status == LinkStatus.AwaitPlayerSettings) then
+      console:log("Received status: AwaitPlayerSettings")
       if (source == Direction.CLIENT) then
-        celio_server._send(Direction.CLIENT, tostring(CommandType.SetModeMaster), require'websocket'.TEXT)
+        celio_server._send(Direction.CLIENT, "command", {
+          commandType = CommandType.PlayerSettings,
+          args = { playerCount = 2, playerIndex = 1 }
+        })
       elseif (source == Direction.SERVER)  then
-        celio_server._send(Direction.SERVER, tostring(CommandType.SetModeSlave), require'websocket'.TEXT)
+        celio_server._send(Direction.SERVER, "command", { CommandType.PlayerSettings, 2, 0 })
       end
 
     elseif (status == LinkStatus.HandshakeReceived) then
@@ -1991,10 +2438,10 @@ local create_celio_server = function (send)
       console:log("Received status: LinkConnected")
       if (source == Direction.CLIENT) then
         celio_server._client = LinkStatus.LinkConnected
-        celio_server._send(Direction.SERVER, tostring(CommandType.ConnectLink), require'websocket'.TEXT)
+        celio_server._send(Direction.SERVER, "command", { CommandType.ConnectLink })
       elseif (source == Direction.SERVER)  then
         celio_server._server = LinkStatus.LinkConnected
-        celio_server._send(Direction.CLIENT, tostring(CommandType.ConnectLink), require'websocket'.TEXT)
+        celio_server._send(Direction.CLIENT, "command", { commandType = CommandType.ConnectLink })
       end
 
     elseif (status == LinkStatus.LinkReconnecting) then
@@ -2017,27 +2464,12 @@ local create_celio_server = function (send)
 
   --////////////////////////////////////////////////////////////////////////////////////////////////////////--
 
+  -- data is a byte array of packets [seat, 8 little endian words]
   function celio_server:receive_data(source, data)
     if (source == Direction.SERVER) then
-      celio_server._send(Direction.CLIENT, data, require'websocket'.BINARY)
+      celio_server._send(Direction.CLIENT, "data", data)
     elseif (source == Direction.CLIENT) then
-      celio_server._send(Direction.SERVER, data, require'websocket'.BINARY)
-    end
-  end
-
-  --////////////////////////////////////////////////////////////////////////////////////////////////////////--
-
-  function celio_server:receive(source, message, opcode)
-    if (opcode == require'websocket'.TEXT) then
-      if (source == Direction.SERVER) then
-        console:log("Received raw status from emulated device: " .. string.format("0x%x", tonumber(message)))
-      end
-      if (source == Direction.CLIENT) then 
-        console:log("Received raw status from connected device: " .. string.format("0x%x", tonumber(message)))
-      end
-      celio_server:receive_status(source, tonumber(message))
-    elseif (opcode == require'websocket'.BINARY) then
-      celio_server:receive_data(source, message)
+      celio_server._send(Direction.SERVER, "data", data)
     end
   end
 
@@ -2057,7 +2489,7 @@ local celio_device = nil
 local server = nil
 local watchpointId = nil
 
-console:log("Celio-mGBA-Link Version 0.2")
+console:log("Celio-mGBA-Link Version 0.3")
 console:log("Waiting for emulation to start")
 
 local function start()
@@ -2073,19 +2505,21 @@ local function start()
     function ()
       local rx_value_current = emu.memory.io:read16(0x12A)
       if (celio_device == nil) then return end
-      local tx_value_current = celio_device:transive(rx_value_current)
-      if (celio_device.mode == Mode.MASTER) then
-        emu.memory.io:write16(0x120, tx_value_current)
-        emu.memory.io:write16(0x122, rx_value_current)
-        emu.memory.io:write16(0x124, 0xFFFF)
-        emu.memory.io:write16(0x126, 0xFFFF)
-      else
-        emu.memory.io:write16(0x120, rx_value_current)
-        emu.memory.io:write16(0x122, tx_value_current)
-        emu.memory.io:write16(0x124, 0xFFFF)
-        emu.memory.io:write16(0x126, 0xFFFF)
+      local tx_values_current = celio_device:transive(rx_value_current)
+
+      -- SIOMULTI0-3 hold the value of each seat, the partners values are in ascending seat order, unused seats are 0xFFFF
+      local tx_index = 1
+      for seat = 0, 3 do
+        local value = 0xFFFF
+        if (seat == celio_device.seat) then
+          value = rx_value_current
+        elseif (seat < celio_device.player_count) then
+          value = tx_values_current[tx_index]
+          tx_index = tx_index + 1
+        end
+        emu.memory.io:write16(0x120 + seat * 2, value)
       end
-      
+
     end,
     0x4000122,
     C.WATCHPOINT_TYPE.READ
@@ -2117,28 +2551,49 @@ local function start()
     protocols = {
       celio_local = function(ws)
 
-        local celio_server = celio_server_factory.create_celio_server(function(dest, message, opcode)
+        -- only messages to the client are json encoded, the emulated device is called directly
+        local celio_server = celio_server_factory.create_celio_server(function(dest, msg_type, body)
           if (dest == Direction.SERVER and celio_device ~= nil) then
-            celio_device:receive(message, opcode)
+            if (msg_type == "command") then
+              celio_device:receive_command(body)
+            elseif (msg_type == "data") then
+              celio_device:receive_data(body)
+            end
           elseif (dest == Direction.CLIENT) then
-            ws:send(message, opcode)
+            ws:send(require'json'.encode({ type = msg_type, body = body }), require'websocket'.TEXT)
           end
         end)
 
         celio_device = celio_device_factory.create_celio_device(
-          function(message) celio_server:receive(Direction.SERVER, tostring(message), require'websocket'.TEXT) end,
-          function(message) celio_server:receive(Direction.SERVER, message, require'websocket'.BINARY) end
+          function(status) celio_server:receive_status(Direction.SERVER, status) end,
+          function(data) celio_server:receive_data(Direction.SERVER, { string.byte(data, 1, -1) }) end
         )
 
-        celio_device:receive_command(CommandType.EmuSessionStart)
+        celio_device:receive_command({ CommandType.EmuSessionStart })
 
         ws:set_on_message(function(ws, message, opcode)
-          if (opcode == require'websocket'.TEXT and message == "getVersion") then
+          -- legacy version check of clients that predate the json protocol
+          if (message == "getVersion") then
             console:log("Sending version info")
-            ws:send("0.2", require'websocket'.TEXT)
+            ws:send("0.3", require'websocket'.TEXT)
             return
           end
-          celio_server:receive(Direction.CLIENT, message, opcode)
+
+          local msg = require'json'.decode(message)
+
+          if (msg.type == "versionRequest") then
+            console:log("Sending version info")
+            ws:send(require'json'.encode({ type = "version", body = "0.3" }), require'websocket'.TEXT)
+
+          elseif (msg.type == "status") then
+            celio_server:receive_status(Direction.CLIENT, msg.body)
+
+          elseif (msg.type == "data") then
+            celio_server:receive_data(Direction.CLIENT, msg.body)
+            
+          else
+            console:warn("Ignoring message type: " .. tostring(msg.type))
+          end
         end)
 
       end,
@@ -2146,17 +2601,75 @@ local function start()
       celio_online = function(ws)
 
         celio_device = require'celio_device'.create_celio_device(
-          function(message) ws:send(tostring(message), require'websocket'.TEXT) end,
-          function(message) ws:send(message, require'websocket'.BINARY) end
+          function(status)
+            ws:send(require'json'.encode({ type = "status", body = status }), require'websocket'.TEXT)
+          end,
+          function(data)
+            local body = { string.byte(data, 1, -1) }
+            ws:send(require'json'.encode({ type = "data", body = body }), require'websocket'.TEXT)
+          end
         )
 
         ws:set_on_message(function(ws, message, opcode)
-          if (opcode == require'websocket'.TEXT and message == "getVersion") then
-            console:log("Sending version info")
-            ws:send("0.2", require'websocket'.TEXT)
+          if (opcode ~= require'websocket'.TEXT) then
+            console:warn("Ignoring non-text message")
             return
           end
-          celio_device:receive(message, opcode)
+
+          -- legacy version check of clients that predate the json protocol
+          if (message == "getVersion") then
+            console:log("Sending version info")
+            ws:send("0.3", require'websocket'.TEXT)
+            return
+          end
+
+          local ok, msg = pcall(require'json'.decode, message)
+          if (not ok or type(msg) ~= "table") then
+            console:warn("Ignoring invalid json: " .. tostring(message))
+            return
+          end
+
+          if (type(msg.type) ~= "string") then
+            console:warn("Ignoring message without type: " .. message)
+            return
+          end
+
+          local msg_type = msg.type
+
+          if (msg_type == "versionRequest") then
+            console:log("Sending version info")
+            ws:send(require'json'.encode({ type = "version", body = "0.3" }), require'websocket'.TEXT)
+            return
+          end
+
+          local body = {}
+          if (msg.body ~= nil) then
+            if (type(msg.body) ~= "table") then
+              console:warn("Ignoring message with invalid body: " .. message)
+              return
+            end
+            for i = 1, #msg.body do
+              local value = math.tointeger(msg.body[i])
+              if (value == nil or value < 0 or value > 0xFF) then
+                console:warn("Ignoring message with non uint8 body value: " .. message)
+                return
+              end
+              body[i] = value
+            end
+          end
+
+          if (msg_type == "command") then
+            celio_device:receive_command(body)
+            return
+          end
+
+          if (msg_type == "data") then
+            celio_device:receive_data(body)
+            return
+          end
+
+          console:warn("Ignoring message type: " .. msg_type)
+
         end)
       end,
     }

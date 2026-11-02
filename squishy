@@ -10,6 +10,7 @@ Module "websocket.server" "websocket/server.lua"
 Module "websocket.sha1" "websocket/sha1.lua"
 Module "websocket.tools" "websocket/tools.lua"
 Module "websocket" "websocket.lua"
+Module "json" "json.lua"
 Module "celio_device" "celio_device.lua"
 Module "celio_server" "celio_server.lua"
 

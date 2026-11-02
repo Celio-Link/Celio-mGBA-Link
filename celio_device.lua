@@ -1,7 +1,7 @@
 
 local LinkStatus = {
   AwaitModeEmulator = 0xFF01,
-  AwaitMode = 0xFF02,
+  AwaitPlayerSettings = 0xFF02,
   HandshakeReceived = 0xFF03,
   HandshakeFinished = 0xFF04,
   LinkConnected = 0xFF05,
@@ -18,8 +18,7 @@ local LinkStatus = {
 local CommandType = {
   SetMode = 0x00,
   Cancel = 0x01,
-  SetModeMaster = 0x10,
-  SetModeSlave = 0x11,
+  PlayerSettings = 0x10,
   StartHandshake = 0x12,
   ConnectLink = 0x13,
 
@@ -53,6 +52,9 @@ local TM3CNT_H = 0x10E
 local SIO_IRQ_IE_MASK = 0x80
 local SIO_IRQ_IF_MASK = 0x80
 
+local PACKET_SIZE = 17 -- seat byte + 8 little endian words
+local MAX_BUFFERED_PACKETS = 3
+
 local create_celio_device = function(emit_status_callback, emit_data_callback)
 
   local create_state = function(init)
@@ -66,10 +68,11 @@ local create_celio_device = function(emit_status_callback, emit_data_callback)
       _start_response = false,
       _start_connect = false, --this field is only relevent in master mode
 
-      _received_queue = {},
-      _transmit_queue = {},
-      _current_tx_command = {},
+      _received_queues = {}, -- received words, keyed by seat of the partner
+      _transmit_queue = {}, -- rx commands of the GBA waiting to be flushed
+      _current_tx_commands = {}, -- one command per partner, in ascending seat order
       _current_rx_command = {},
+      _partner_reconnect = {},
       _empty_direction_streak = 0,
 
       _checksum = 0,
@@ -89,27 +92,50 @@ local create_celio_device = function(emit_status_callback, emit_data_callback)
     emit_status = emit_status_callback,
     emit_data = emit_data_callback,
     mode = Mode.SLAVE,
-    timer_enabled = false
+    timer_enabled = false,
+    player_count = 2,
+    seat = 0 -- seat of the emulated GBA, seat 0 is the master
   }
+
+  --////////////////////////////////////////////////////////////////////////////////////////////////////////--
+
+  -- Seats of all other players in ascending order, which is the order their values are transmitted in
+  function celio_device:partner_seats()
+    local seats = {}
+    for seat = 0, celio_device.player_count - 1 do
+      if (seat ~= celio_device.seat) then table.insert(seats, seat) end
+    end
+    return seats
+  end
+
+  --////////////////////////////////////////////////////////////////////////////////////////////////////////--
+
+  local for_each_partner = function (value)
+    local values = {}
+    for i = 1, celio_device.player_count - 1 do
+      values[i] = value
+    end
+    return values
+  end
 
   --////////////////////////////////////////////////////////////////////////////////////////////////////////--
 
   function celio_device:transive(rx_value)
     if (celio_device.state._transive_state == Transive.HANDSHAKE) then
-      local tx_value = celio_device:transive_handshake(rx_value)
+      local tx_values = celio_device:transive_handshake(rx_value)
       -- console:log("Handshake - RX: " .. string.format("0x%x", rx_value) .. " TX: " .. string.format("0x%x", tx_value))
       --console:log("HandshakeState " .. tonumber(celio_device.state._handshakeState))
-      return tx_value
+      return tx_values
     end
     if (celio_device.state._transive_state == Transive.CRC) then
-      local tx_value = celio_device:transive_crc(rx_value)
+      local tx_values = celio_device:transive_crc(rx_value)
       --console:log("CRC - RX: " .. string.format("0x%x", rx_value) .. " TX: " .. string.format("0x%x", tx_value))
-      return tx_value
+      return tx_values
     end
     if (celio_device.state._transive_state == Transive.COMMAND) then
-      local tx_value = celio_device:transive_command(rx_value)
+      local tx_values = celio_device:transive_command(rx_value)
       --console:log("Command - RX: " .. string.format("0x%x", rx_value) .. " TX: " .. string.format("0x%x", tx_value))
-      return tx_value
+      return tx_values
     end
   end
 
@@ -183,10 +209,13 @@ local create_celio_device = function(emit_status_callback, emit_data_callback)
       celio_device.state._handshakeState = HandshakeState.WAITING_TO_RESPOND
     end
 
+    -- the master (seat 0) is always the first partner, it sends the master handshake while the others keep responding
     if (celio_device.state._start_connect) then
       celio_device.emit_status(LinkStatus.LinkConnected)
       celio_device.state._transive_state = Transive.CRC
-      return 0x8FFF
+      local tx_values = for_each_partner(0xB9A0)
+      tx_values[1] = 0x8FFF
+      return tx_values
     end
 
     if (rx_value == 0x8FFF) then
@@ -195,26 +224,37 @@ local create_celio_device = function(emit_status_callback, emit_data_callback)
     end
 
     if (celio_device.state._handshakeState == HandshakeState.RESPONDING) then
-      return 0xB9A0
+      return for_each_partner(0xB9A0)
     end
 
     -- Fixes a race condition between setting RESPONDING and WAIT_TO_RESPONSE, to lazy to do it in a sane way
     if (celio_device.state._start_response) then celio_device.state._handshakeState = HandshakeState.RESPONDING end
 
-    return  0xD15E
+    return for_each_partner(0xD15E)
   end
 
   --////////////////////////////////////////////////////////////////////////////////////////////////////////--
 
+  -- Sends the queued commands as packets of [seat, 8 little endian words], same format as received
   local flush_rx_queue = function ()
+    if (#celio_device.state._transmit_queue == 0) then return end
     console:log("Flusing rx queue")
-    for i = #celio_device.state._transmit_queue, 32 do
-      table.insert(celio_device.state._transmit_queue, 0x00)
+
+    -- always send MAX_BUFFERED_PACKETS like the device does, padded with empty commands from the own seat
+    while (#celio_device.state._transmit_queue < MAX_BUFFERED_PACKETS) do
+      table.insert(celio_device.state._transmit_queue, {0,0,0,0,0,0,0,0})
     end
-    local fmt = ">" .. string.rep("I2", #celio_device.state._transmit_queue)
-    local data = string.pack(fmt, table.unpack(celio_device.state._transmit_queue))
+
+    local bytes = {}
+    for _, command in ipairs(celio_device.state._transmit_queue) do
+      table.insert(bytes, celio_device.seat)
+      for _, word in ipairs(command) do
+        table.insert(bytes, word & 0xFF)
+        table.insert(bytes, (word >> 8) & 0xFF)
+      end
+    end
     celio_device.state._transmit_queue = {}
-    celio_device.emit_data(data)
+    celio_device.emit_data(string.char(table.unpack(bytes)))
   end
 
   --////////////////////////////////////////////////////////////////////////////////////////////////////////--
@@ -238,7 +278,7 @@ local create_celio_device = function(emit_status_callback, emit_data_callback)
 
     local checksum = celio_device.state._checksum
     celio_device.state._checksum = 0
-    return checksum
+    return for_each_partner(checksum)
   end
 
   --////////////////////////////////////////////////////////////////////////////////////////////////////////--
@@ -263,15 +303,18 @@ local create_celio_device = function(emit_status_callback, emit_data_callback)
 
   --////////////////////////////////////////////////////////////////////////////////////////////////////////--
 
-  local load_tx_command = function ()
-    if (#celio_device.state._received_queue == 0) then
-      celio_device.state._current_tx_command = {0,0,0,0,0,0,0,0}
-    else
-      for i = 1, 8 do
-        local dequeued_value = table.remove(celio_device.state._received_queue, 1)
-        local swapped = ((dequeued_value >> 8) | (dequeued_value << 8)) & 0xFFFF
-        table.insert(celio_device.state._current_tx_command, swapped)
+  local load_tx_commands = function ()
+    celio_device.state._current_tx_commands = {}
+    for i, seat in ipairs(celio_device:partner_seats()) do
+      local queue = celio_device.state._received_queues[seat] or {}
+      local command = {0,0,0,0,0,0,0,0}
+      if (#queue > 0) then
+        command = {}
+        for j = 1, 8 do
+          table.insert(command, table.remove(queue, 1))
+        end
       end
+      celio_device.state._current_tx_commands[i] = command
     end
   end
 
@@ -305,10 +348,7 @@ local create_celio_device = function(emit_status_callback, emit_data_callback)
 
     if (queue_command) then
       print_command_db("rx command ", celio_device.state._current_rx_command)
-      for i = 1, 8 do
-        local dequeued_value = table.remove(celio_device.state._current_rx_command, 1)
-        table.insert(celio_device.state._transmit_queue, dequeued_value)
-      end
+      table.insert(celio_device.state._transmit_queue, celio_device.state._current_rx_command)
     end
 
     celio_device.state._current_rx_command = {}
@@ -320,16 +360,21 @@ local create_celio_device = function(emit_status_callback, emit_data_callback)
 
     table.insert(celio_device.state._current_rx_command, rx_value)
 
-    if (#celio_device.state._current_tx_command == 0) then
-      load_tx_command()
-      if (celio_device.state._current_tx_command[1] == 0xcafe and celio_device.state._current_tx_command[2] == 0x0017) then
-        celio_device.state._keep_alive = false
+    if (#celio_device.state._current_tx_commands == 0 or #celio_device.state._current_tx_commands[1] == 0) then
+      load_tx_commands()
+      local all_partners_reconnect = true
+      for i, command in ipairs(celio_device.state._current_tx_commands) do
+        if (command[1] == 0xcafe and command[2] == 0x0017) then
+          celio_device.state._keep_alive = false
+        end
+        if (command[1] == 0x5fff and not celio_device.state._partner_reconnect[i]) then
+          console:log("Emulated Device: Partner " .. tostring(i) .. " ready for reconnect")
+          celio_device.state._partner_reconnect[i] = true
+        end
+        all_partners_reconnect = all_partners_reconnect and celio_device.state._partner_reconnect[i] == true
+        print_command_db("tx command " .. tostring(i) .. " ", command)
       end
-      if (celio_device.state._current_tx_command[1] == 0x5fff) then
-        console:log("Emulated Device: Partner ready for reconnect")
-        celio_device.state._emu_reconnect = true
-      end
-      print_command_db("tx command ", celio_device.state._current_tx_command)
+      celio_device.state._emu_reconnect = all_partners_reconnect
     end
 
     if (#celio_device.state._current_rx_command == 8) then
@@ -342,49 +387,58 @@ local create_celio_device = function(emit_status_callback, emit_data_callback)
       celio_device.state._transive_state = Transive.CRC
     end
 
-    if (#celio_device.state._transmit_queue >= 32) then
+    if (#celio_device.state._transmit_queue >= MAX_BUFFERED_PACKETS) then
       flush_rx_queue()
     end
 
-    local tx_value = table.remove(celio_device.state._current_tx_command, 1)
-    celio_device.state._checksum = (celio_device.state._checksum + tx_value) & 0xFFFF
+    local tx_values = {}
+    for i, command in ipairs(celio_device.state._current_tx_commands) do
+      tx_values[i] = table.remove(command, 1)
+      celio_device.state._checksum = (celio_device.state._checksum + tx_values[i]) & 0xFFFF
+    end
     celio_device.state._checksum = (celio_device.state._checksum + rx_value) & 0xFFFF
 
-    return tx_value
+    return tx_values
   end
 
   --////////////////////////////////////////////////////////////////////////////////////////////////////////--
 
   function celio_device:receive_command(command)
-    if (command == CommandType.SetMode) then
+    local commandType = command[1]
+
+    if (commandType == CommandType.SetMode) then
       console:log("Emulated Device - Received Command: SetMode")
       celio_device.emit_status(LinkStatus.DeviceReady)
-      celio_device.emit_status(LinkStatus.AwaitMode)
+      celio_device.emit_status(LinkStatus.AwaitPlayerSettings)
 
-    elseif (command == CommandType.EmuSessionStart) then
+    elseif (commandType == CommandType.EmuSessionStart) then
       console:log("Emulated Device - Received Command: EmuSessionStart")
-      celio_device.emit_status(LinkStatus.AwaitMode)
+      celio_device.emit_status(LinkStatus.AwaitPlayerSettings)
 
-    elseif (command == CommandType.SetModeSlave) then
-      console:log("Emulated Device - Received Command: SetModeSlave")
+    elseif (commandType == CommandType.PlayerSettings) then
+      celio_device.player_count = command[2]
+      celio_device.seat = command[3]
+      console:log("Emulated Device - Received Command: PlayerSettings, player count "
+        .. tostring(celio_device.player_count) .. ", seat " .. tostring(celio_device.seat))
       celio_device.state._handshakeState = HandshakeState.LISTENING
-      celio_device.mode = Mode.SLAVE
-      emu:setSioMaster()
+      -- the emulated GBA in seat 0 is the master, so the device has to act as slave and vice versa
+      if (celio_device.seat == 0) then
+        celio_device.mode = Mode.SLAVE
+        emu:setSioMaster()
+      else
+        celio_device.mode = Mode.MASTER
+        emu:setSioSlave()
+      end
 
-    elseif (command == CommandType.SetModeMaster) then
-      console:log("Emulated Device - Received Command: SetModeMaster")
-      celio_device.state._handshakeState = HandshakeState.LISTENING
-      celio_device.mode = Mode.MASTER
-      emu:setSioSlave()
-
-    elseif (command == CommandType.StartHandshake) then
+    elseif (commandType == CommandType.StartHandshake) then
       console:log("Emulated Device - Received Command: StartHandshake")
       -- celio_device.state._handshakeState = HandshakeState.RESPONDING
       celio_device.state._start_response = true
 
-    elseif (command == CommandType.ConnectLink) then
-      celio_device.state._start_connect = true
+    elseif (commandType == CommandType.ConnectLink) then
       console:log("Emulated Device - Received Command: ConnectLink")
+      -- as seat 0 the emulated GBA sends the master handshake itself
+      if (celio_device.seat ~= 0) then celio_device.state._start_connect = true end
       
 
     else
@@ -394,24 +448,21 @@ local create_celio_device = function(emit_status_callback, emit_data_callback)
 
   --////////////////////////////////////////////////////////////////////////////////////////////////////////--
 
+  -- data is a list of packets [seat, 8 little endian words], each word is queued for the seat it came from
   function celio_device:receive_data(data)
-    for i = 1, #data, 2 do
-      local value = string.unpack(">I2", data, i)
-      table.insert(celio_device.state._received_queue, value)
+    for offset = 1, #data - PACKET_SIZE + 1, PACKET_SIZE do
+      local seat = data[offset]
+      if (seat ~= celio_device.seat and seat < celio_device.player_count) then
+        local queue = celio_device.state._received_queues[seat] or {}
+        celio_device.state._received_queues[seat] = queue
+        for i = offset + 1, offset + PACKET_SIZE - 1, 2 do
+          table.insert(queue, data[i] | (data[i + 1] << 8))
+        end
       end
+    end
   end
 
   --////////////////////////////////////////////////////////////////////////////////////////////////////////--
-
-  function celio_device:receive(message, opcode)
-      if (opcode == require'websocket'.TEXT) then
-        console:log(message .. "")
-        console:log("Received raw status: " .. string.format("0x%x", tonumber(message)))
-        celio_device:receive_command(tonumber(message))
-      elseif (opcode == require'websocket'.BINARY) then
-        celio_device:receive_data(message)
-      end
-    end
 
   return celio_device
 end
